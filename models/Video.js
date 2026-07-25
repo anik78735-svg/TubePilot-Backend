@@ -11,6 +11,13 @@ const VideoSchema = new mongoose.Schema({
   audience: { type: String, enum: ['made_for_kids', 'not_for_kids'], default: 'not_for_kids' },
   privacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: 'public' },
 
+  // The privacy the user ultimately wants for this video. Normally equal to
+  // privacyStatus. Differs only when the user picked "Public" with a future
+  // Schedule Time: the video uploads immediately as 'unlisted' (privacyStatus),
+  // and cron/scheduler.js flips privacyStatus to 'public' once scheduledAt
+  // arrives, to match this target.
+  targetPrivacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: null },
+
   thumbnailUrl: { type: String, default: '' },
 
   // storage tracking

@@ -48,6 +48,12 @@ const storeVideoFile = async (buffer, filename, mimetype) => {
 
 // @route POST /api/videos/upload
 // multipart/form-data: video, thumbnail(optional), title, description, tags, category, playlist, audience, scheduledAt(optional)
+//
+// Privacy behaviour:
+// - privacyStatus 'unlisted' or 'private': uploads immediately with that privacy, and stays that way permanently.
+// - privacyStatus 'public' with no scheduledAt: uploads immediately as public.
+// - privacyStatus 'public' WITH scheduledAt: uploads immediately as 'unlisted' (so it's live but hidden),
+//   and cron/scheduler.js's privacy-publish job flips it to 'public' once scheduledAt arrives.
 router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   try {
     const user = req.user;
@@ -60,6 +66,12 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
     if (!user.youtubeChannel) {
       return res.status(400).json({ success: false, message: 'Please connect a YouTube channel first' });
     }
+
+    const requestedPrivacy = ['public', 'unlisted', 'private'].includes(privacyStatus) ? privacyStatus : 'public';
+    // Only "Public + a future scheduledAt" delays going public; every other
+    // combination uploads immediately at the privacy the user picked.
+    const isDelayedPublic = requestedPrivacy === 'public' && !!scheduledAt;
+    const initialPrivacyStatus = isDelayedPublic ? 'unlisted' : requestedPrivacy;
 
     // Charge credit BEFORE the (slow) upload so we never store a video the user can't afford
     const charge = chargeForUpload(user);
@@ -86,14 +98,15 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       category: category || '22',
       playlist: playlist || '',
       audience: audience || 'not_for_kids',
-      privacyStatus: ['public', 'unlisted', 'private'].includes(privacyStatus) ? privacyStatus : 'public',
+      privacyStatus: initialPrivacyStatus,
+      targetPrivacyStatus: requestedPrivacy,
       thumbnailUrl,
       storageProvider: stored.storageProvider,
       storageFileId: stored.storageFileId,
       storageUrl: stored.storageUrl,
       fileSizeBytes: videoFile.size,
-      scheduledAt: scheduledAt || null,
-      status: scheduledAt ? 'scheduled' : 'queued',
+      scheduledAt: isDelayedPublic ? scheduledAt : null,
+      status: 'queued',
       diamondsCharged: charge.diamondsCharged,
       usedFreeUpload: charge.usedFreeUpload
     });
@@ -101,8 +114,10 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
     user.storageUsedBytes += videoFile.size;
     await user.save();
 
-    // If not scheduled, the actual push-to-YouTube step is handled by the same
-    // cron worker (cron/scheduler.js) picking up 'queued' videos immediately.
+    // Every video is picked up immediately by the same cron worker
+    // (cron/scheduler.js) since status is always 'queued' here. If this is a
+    // delayed-public video, a separate cron job in the same file later flips
+    // its privacy from 'unlisted' to 'public' once scheduledAt arrives.
 
     res.status(201).json({ success: true, video });
   } catch (err) {

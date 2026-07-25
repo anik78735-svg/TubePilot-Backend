@@ -27,7 +27,7 @@ const UserSchema = new mongoose.Schema({
   referralCode: { type: String, unique: true, sparse: true },
   referredBy: { type: String, default: null },
 
-  diamondBalance: { type: Number, default: 0 },
+  diamondBalance: { type: Number, default: 10 }, // starter bonus so AI features work out of the box
   autoRefillDiamonds: { type: Boolean, default: false },
 
   freeUploadsRemaining: { type: Number, default: 20 },

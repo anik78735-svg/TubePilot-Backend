@@ -54,7 +54,7 @@ router.post('/signup', async (req, res) => {
       authProvider: 'local',
       referralCode,
       referredBy: referredBy || null,
-      diamondBalance: 0,
+      diamondBalance: 10,
       freeUploadsRemaining: Number(process.env.FREE_UPLOADS_PER_MONTH || 20)
     });
 
@@ -201,6 +201,46 @@ router.post('/setup-username', protect, async (req, res) => {
     await req.user.save();
 
     res.json({ success: true, user: req.user.toSafeObject() });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// @route POST /api/auth/apply-referral  { referralCode }
+// Called once, typically right after signup. Both the new user and the
+// referrer get a small diamond bonus. Real logic — validates the code
+// belongs to someone else and hasn't already been used by this user.
+const REFERRAL_BONUS_DIAMONDS = 5;
+
+router.post('/apply-referral', protect, async (req, res) => {
+  try {
+    const { referralCode } = req.body;
+    if (!referralCode) return res.status(400).json({ success: false, message: 'referralCode is required' });
+
+    if (req.user.referredBy) {
+      return res.status(400).json({ success: false, message: 'You have already used a referral code' });
+    }
+
+    const referrer = await User.findOne({ referralCode: referralCode.trim().toUpperCase() });
+    if (!referrer) {
+      return res.status(404).json({ success: false, message: 'Invalid referral code' });
+    }
+    if (referrer._id.equals(req.user._id)) {
+      return res.status(400).json({ success: false, message: "You can't use your own referral code" });
+    }
+
+    req.user.referredBy = referrer.userId;
+    req.user.diamondBalance += REFERRAL_BONUS_DIAMONDS;
+    await req.user.save();
+
+    referrer.diamondBalance += REFERRAL_BONUS_DIAMONDS;
+    await referrer.save();
+
+    res.json({
+      success: true,
+      message: `Referral applied! You both received ${REFERRAL_BONUS_DIAMONDS} bonus diamonds.`,
+      diamondBalance: req.user.diamondBalance
+    });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }

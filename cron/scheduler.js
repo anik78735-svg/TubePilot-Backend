@@ -5,7 +5,8 @@ const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
 const { refreshAccessToken, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy } = require('../utils/youtube');
-const { getDriveFileStream } = require('../utils/googleDrive');
+const { getDriveFileStream, deleteDriveFile } = require('../utils/googleDrive');
+const { deleteFromCloudinary, account1, account2 } = require('../utils/cloudinary');
 
 // Returns a readable stream for the stored video file regardless of which
 // storage tier it landed on (Cloudinary 1/2 or Google Drive).
@@ -16,6 +17,31 @@ const getVideoStream = async (video) => {
   // Cloudinary: stream the file straight from its secure URL
   const response = await axios.get(video.storageUrl, { responseType: 'stream' });
   return response.data;
+};
+
+// Permanently removes the video file from whichever storage tier it was on.
+// Called once the video has been successfully pushed to YouTube — we don't
+// need to keep our own copy anymore, and this keeps user data minimal
+// (matches the app's Privacy Policy: videos aren't retained after upload).
+// Failure here is logged but never fails the overall upload — the YouTube
+// video is already live, so we don't want to mark it as failed just because
+// cleanup didn't succeed. `video.storageUrl` is only cleared on success, so
+// a failed cleanup can be noticed/retried later by an admin if needed.
+const deleteStoredVideoFile = async (video) => {
+  try {
+    if (video.storageProvider === 'cloudinary_1') {
+      await deleteFromCloudinary(account1, video.storageFileId);
+    } else if (video.storageProvider === 'cloudinary_2') {
+      await deleteFromCloudinary(account2, video.storageFileId);
+    } else if (video.storageProvider === 'google_drive') {
+      await deleteDriveFile(video.storageFileId);
+    } else {
+      return; // no storage provider recorded, nothing to delete
+    }
+    video.storageUrl = '';
+  } catch (err) {
+    console.error(`Failed to delete stored file for video ${video._id}:`, err.message);
+  }
 };
 
 const ensureFreshAccessToken = async (user) => {
@@ -61,6 +87,11 @@ const processVideo = async (video) => {
     video.status = 'uploaded';
     video.youtubeVideoId = result.id;
     video.youtubeUrl = `https://youtube.com/watch?v=${result.id}`;
+
+    // Video is now live on YouTube — our own storage copy is redundant.
+    // Delete it so we don't retain user video files longer than necessary.
+    await deleteStoredVideoFile(video);
+
     await video.save();
 
     const privacyLabel = video.privacyStatus === 'public' ? 'public' : video.privacyStatus;
@@ -101,9 +132,6 @@ const processVideo = async (video) => {
 };
 
 // Runs every minute: uploads any freshly-queued video immediately.
-// (Videos are never left in 'scheduled' status waiting to upload anymore —
-// see routes/video.js: every upload is queued right away. A delayed-public
-// video still uploads now, just as 'unlisted'; see startPrivacyPublishScheduler below.)
 const startScheduler = () => {
   cron.schedule('* * * * *', async () => {
     try {
@@ -121,7 +149,8 @@ const startScheduler = () => {
 };
 
 // Flips an already-uploaded, currently-unlisted video to 'public' on YouTube
-// once its scheduledAt time arrives. Does NOT re-upload the file.
+// once its scheduledAt time arrives. Does NOT re-upload the file (the file
+// no longer exists in our storage anyway — see deleteStoredVideoFile above).
 const processPrivacyPublish = async (video) => {
   const user = await User.findById(video.user);
   if (!user || !user.youtubeChannel) {

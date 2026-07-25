@@ -21,6 +21,12 @@ const analyticsRoutes = require('./routes/analytics');
 
 const app = express();
 
+// --- Trust proxy (required on Render/Heroku/Vercel etc, hosted behind a reverse proxy) ---
+// This must be set BEFORE any middleware that reads req.ip / X-Forwarded-For,
+// including express-rate-limit below. Value "1" means: trust the first hop
+// (Render's own proxy) — correct for a standard single-proxy deployment.
+app.set('trust proxy', 1);
+
 // --- Security & core middleware ---
 app.use(helmet());
 
@@ -79,12 +85,37 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 5000;
 
+// --- Keep-alive self-ping (prevents Render free-tier service from sleeping) ---
+// Render sets RENDER_EXTERNAL_URL automatically on deployed services, so this
+// only runs in that environment and stays inactive during local development.
+const startKeepAlivePing = () => {
+  const baseUrl = process.env.RENDER_EXTERNAL_URL;
+  if (!baseUrl) {
+    console.log('ℹ️  RENDER_EXTERNAL_URL not set, skipping keep-alive ping (likely local dev)');
+    return;
+  }
+
+  const pingIntervalMs = 13 * 60 * 1000; // 13 minutes (under most free-tier ~15min idle timeouts)
+
+  setInterval(async () => {
+    try {
+      const res = await fetch(`${baseUrl}/api/health`);
+      console.log(`🔁 Keep-alive ping: ${res.status} at ${new Date().toISOString()}`);
+    } catch (err) {
+      console.warn(`⚠️  Keep-alive ping failed: ${err.message}`);
+    }
+  }, pingIntervalMs);
+
+  console.log(`⏱️  Keep-alive ping scheduled every ${pingIntervalMs / 60000} minutes to ${baseUrl}/api/health`);
+};
+
 const start = async () => {
   await connectDB();
   app.listen(PORT, () => {
     console.log(`🚀 TubePilot backend running on port ${PORT}`);
     startScheduler();
     startFreeUploadReset();
+    startKeepAlivePing();
   });
 };
 

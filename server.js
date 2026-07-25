@@ -6,7 +6,7 @@ const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
 
 const connectDB = require('./config/db');
-const { startScheduler, startFreeUploadReset } = require('./cron/scheduler');
+const { startScheduler, startFreeUploadReset, startPrivacyPublishScheduler } = require('./cron/scheduler');
 
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
@@ -115,6 +115,7 @@ const start = async () => {
     console.log(`🚀 TubePilot backend running on port ${PORT}`);
     startScheduler();
     startFreeUploadReset();
+    startPrivacyPublishScheduler();
     startKeepAlivePing();
   });
 };

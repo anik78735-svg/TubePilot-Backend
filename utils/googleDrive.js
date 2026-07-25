@@ -46,4 +46,12 @@ const getDriveFileStream = async (fileId) => {
   return res.data;
 };
 
-module.exports = { uploadBufferToDrive, getDriveFileStream };
+// Permanently deletes a previously uploaded file from Google Drive. Used once
+// the video has been successfully pushed to YouTube, so we don't keep a
+// redundant copy of the file in our own storage.
+const deleteDriveFile = async (fileId) => {
+  const drive = getDriveClient();
+  return drive.files.delete({ fileId });
+};
+
+module.exports = { uploadBufferToDrive, getDriveFileStream, deleteDriveFile };

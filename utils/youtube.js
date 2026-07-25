@@ -62,7 +62,26 @@ const setThumbnail = async ({ accessToken, refreshToken, videoId, thumbnailStrea
   return youtube.thumbnails.set({ videoId, media: { body: thumbnailStream } });
 };
 
+// Switches an already-uploaded video's privacy status (e.g. unlisted -> public)
+// without re-uploading the file. Used by cron/scheduler.js to publish a video
+// that was uploaded unlisted and scheduled to go public later.
+const updateVideoPrivacy = async ({ accessToken, refreshToken, videoId, privacyStatus }) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+
+  const res = await youtube.videos.update({
+    part: 'status',
+    requestBody: {
+      id: videoId,
+      status: { privacyStatus }
+    }
+  });
+
+  return res.data;
+};
+
 module.exports = {
   getOAuthClient, exchangeCodeForTokens, refreshAccessToken,
-  getChannelInfo, uploadVideoToYouTube, setThumbnail
+  getChannelInfo, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy
 };

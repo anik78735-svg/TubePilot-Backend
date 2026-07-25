@@ -4,7 +4,7 @@ const Video = require('../models/Video');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
-const { refreshAccessToken, uploadVideoToYouTube, setThumbnail } = require('../utils/youtube');
+const { refreshAccessToken, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy } = require('../utils/youtube');
 const { getDriveFileStream } = require('../utils/googleDrive');
 
 // Returns a readable stream for the stored video file regardless of which
@@ -64,15 +64,20 @@ const processVideo = async (video) => {
     await video.save();
 
     const privacyLabel = video.privacyStatus === 'public' ? 'public' : video.privacyStatus;
+    const willGoPublicLater = video.targetPrivacyStatus === 'public' && video.privacyStatus !== 'public';
     await Notification.create({
       user: user._id,
       type: 'upload_completed',
       title: 'Upload Completed ✅',
-      message: `"${video.title}" is now live on YouTube (${privacyLabel}).`
+      message: willGoPublicLater
+        ? `"${video.title}" is uploaded (unlisted) and will go public at the scheduled time.`
+        : `"${video.title}" is now live on YouTube (${privacyLabel}).`
     });
     await sendPushToUser(user, {
       title: 'Your video is live! 🎉',
-      body: `"${video.title}" just went ${privacyLabel} on YouTube.`,
+      body: willGoPublicLater
+        ? `"${video.title}" is uploaded and scheduled to go public soon.`
+        : `"${video.title}" just went ${privacyLabel} on YouTube.`,
       data: { type: 'upload_completed', videoId: video._id.toString(), youtubeUrl: video.youtubeUrl }
     });
   } catch (err) {
@@ -95,17 +100,14 @@ const processVideo = async (video) => {
   }
 };
 
-// Runs every minute: uploads immediately-queued videos + any scheduled video whose time has arrived
+// Runs every minute: uploads any freshly-queued video immediately.
+// (Videos are never left in 'scheduled' status waiting to upload anymore —
+// see routes/video.js: every upload is queued right away. A delayed-public
+// video still uploads now, just as 'unlisted'; see startPrivacyPublishScheduler below.)
 const startScheduler = () => {
   cron.schedule('* * * * *', async () => {
     try {
-      const now = new Date();
-      const dueVideos = await Video.find({
-        $or: [
-          { status: 'queued' },
-          { status: 'scheduled', scheduledAt: { $lte: now } }
-        ]
-      }).limit(10);
+      const dueVideos = await Video.find({ status: 'queued' }).limit(10);
 
       for (const video of dueVideos) {
         await processVideo(video);
@@ -116,6 +118,67 @@ const startScheduler = () => {
   });
 
   console.log('⏰ Upload scheduler is running (checks every minute)');
+};
+
+// Flips an already-uploaded, currently-unlisted video to 'public' on YouTube
+// once its scheduledAt time arrives. Does NOT re-upload the file.
+const processPrivacyPublish = async (video) => {
+  const user = await User.findById(video.user);
+  if (!user || !user.youtubeChannel) {
+    console.error(`Privacy publish skipped for video ${video._id}: no YouTube channel connected`);
+    return;
+  }
+
+  try {
+    const accessToken = await ensureFreshAccessToken(user);
+    await updateVideoPrivacy({
+      accessToken,
+      refreshToken: user.youtubeChannel.refreshToken,
+      videoId: video.youtubeVideoId,
+      privacyStatus: 'public'
+    });
+
+    video.privacyStatus = 'public';
+    await video.save();
+
+    await Notification.create({
+      user: user._id,
+      type: 'upload_completed',
+      title: 'Video Is Now Public 🌐',
+      message: `"${video.title}" just went public on YouTube as scheduled.`
+    });
+    await sendPushToUser(user, {
+      title: 'Your video is now public! 🎉',
+      body: `"${video.title}" just went public on YouTube.`,
+      data: { type: 'upload_completed', videoId: video._id.toString(), youtubeUrl: video.youtubeUrl }
+    });
+  } catch (err) {
+    console.error(`Privacy publish failed for video ${video._id}:`, err.message);
+  }
+};
+
+// Runs every minute: finds uploaded-but-still-unlisted videos whose
+// scheduled "go public" time has arrived, and publishes them.
+const startPrivacyPublishScheduler = () => {
+  cron.schedule('* * * * *', async () => {
+    try {
+      const now = new Date();
+      const dueVideos = await Video.find({
+        status: 'uploaded',
+        targetPrivacyStatus: 'public',
+        privacyStatus: { $ne: 'public' },
+        scheduledAt: { $lte: now }
+      }).limit(10);
+
+      for (const video of dueVideos) {
+        await processPrivacyPublish(video);
+      }
+    } catch (err) {
+      console.error('Privacy publish scheduler tick error:', err.message);
+    }
+  });
+
+  console.log('🌐 Privacy publish scheduler is running (checks every minute)');
 };
 
 // Monthly free-upload reset: runs once a day, resets any user whose reset date has passed
@@ -146,4 +209,4 @@ const startFreeUploadReset = () => {
   console.log('📅 Monthly free-upload reset job is running');
 };
 
-module.exports = { startScheduler, startFreeUploadReset };
+module.exports = { startScheduler, startFreeUploadReset, startPrivacyPublishScheduler };

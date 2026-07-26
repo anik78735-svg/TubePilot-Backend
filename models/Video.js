@@ -6,25 +6,21 @@ const VideoSchema = new mongoose.Schema({
   title: { type: String, required: true },
   description: { type: String, default: '' },
   tags: [{ type: String }],
-  category: { type: String, default: '22' }, // YouTube category id
+  category: { type: String, default: '22' },
   playlist: { type: String, default: '' },
   audience: { type: String, enum: ['made_for_kids', 'not_for_kids'], default: 'not_for_kids' },
   privacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: 'public' },
 
-  // The privacy the user ultimately wants for this video. Normally equal to
-  // privacyStatus. Differs only when the user picked "Public" with a future
-  // Schedule Time: the video uploads immediately as 'unlisted' (privacyStatus),
-  // and cron/scheduler.js flips privacyStatus to 'public' once scheduledAt
-  // arrives, to match this target.
   targetPrivacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: null },
 
   thumbnailUrl: { type: String, default: '' },
 
-  // storage tracking
   storageProvider: { type: String, enum: ['cloudinary_1', 'cloudinary_2', 'google_drive', 'youtube'], default: null },
   storageFileId: { type: String, default: '' },
   storageUrl: { type: String, default: '' },
   fileSizeBytes: { type: Number, default: 0 },
+
+  storageDeleteAt: { type: Date, default: null },
 
   scheduledAt: { type: Date, default: null },
 

@@ -17,38 +17,25 @@ const uploadBufferToDrive = async (buffer, filename, mimeType) => {
   bufferStream.end(buffer);
 
   const res = await drive.files.create({
-    requestBody: {
-      name: filename,
-      parents: [process.env.GOOGLE_DRIVE_FOLDER_ID]
-    },
-    media: {
-      mimeType,
-      body: bufferStream
-    },
+    requestBody: { name: filename, parents: [process.env.GOOGLE_DRIVE_FOLDER_ID] },
+    media: { mimeType, body: bufferStream },
     fields: 'id, webViewLink, webContentLink'
   });
 
-  // Make file readable via link so it can be fetched later for YouTube upload
   await drive.permissions.create({
     fileId: res.data.id,
     requestBody: { role: 'reader', type: 'anyone' }
   });
 
-  return res.data; // { id, webViewLink, webContentLink }
+  return res.data;
 };
 
 const getDriveFileStream = async (fileId) => {
   const drive = getDriveClient();
-  const res = await drive.files.get(
-    { fileId, alt: 'media' },
-    { responseType: 'stream' }
-  );
+  const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
   return res.data;
 };
 
-// Permanently deletes a previously uploaded file from Google Drive. Used once
-// the video has been successfully pushed to YouTube, so we don't keep a
-// redundant copy of the file in our own storage.
 const deleteDriveFile = async (fileId) => {
   const drive = getDriveClient();
   return drive.files.delete({ fileId });

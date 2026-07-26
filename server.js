@@ -18,6 +18,7 @@ const adminRoutes = require('./routes/admin');
 const aiRoutes = require('./routes/ai');
 const notificationRoutes = require('./routes/notifications');
 const analyticsRoutes = require('./routes/analytics');
+const seedAdminRoute = require('./routes/seedAdmin');
 
 const app = express();
 
@@ -71,6 +72,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/seed-admin', seedAdminRoute);
 
 app.get('/api/health', (req, res) => res.json({ success: true, message: 'TubePilot API is running' }));
 

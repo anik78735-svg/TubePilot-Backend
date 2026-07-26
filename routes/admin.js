@@ -164,10 +164,40 @@ router.put('/payment-settings', upload.single('qrImage'), async (req, res) => {
   }
 });
 
-// @route GET /api/admin/users
+// @route GET /api/admin/users?search=text
 router.get('/users', async (req, res) => {
-  const users = await User.find({ role: 'user' }).select('-password -refreshTokens').sort({ createdAt: -1 }).limit(100);
+  const filter = { role: 'user' };
+  const search = (req.query.search || '').trim();
+  if (search) {
+    const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    filter.$or = [{ username: regex }, { email: regex }, { name: regex }, { userId: regex }];
+  }
+  const users = await User.find(filter).select('-password -refreshTokens').sort({ createdAt: -1 }).limit(100);
   res.json({ success: true, users });
+});
+
+// @route PATCH /api/admin/users/:id/force-logout
+// Clears every saved refresh token for this user — their app will be forced
+// back to the login screen the next time their short-lived access token expires.
+router.patch('/users/:id/force-logout', async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+  user.refreshTokens = [];
+  await user.save();
+  res.json({ success: true, message: `${user.username || user.email} has been logged out on all devices` });
+});
+
+// @route PATCH /api/admin/users/:id/toggle-active
+// Suspends or reactivates a user account.
+router.patch('/users/:id/toggle-active', async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+  user.isActive = !user.isActive;
+  if (!user.isActive) user.refreshTokens = []; // also force-logout when suspending
+  await user.save();
+  res.json({ success: true, message: `${user.username || user.email} is now ${user.isActive ? 'active' : 'suspended'}`, isActive: user.isActive });
 });
 
 module.exports = router;

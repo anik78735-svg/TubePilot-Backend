@@ -18,12 +18,10 @@ const callGroq = async (systemPrompt, userPrompt) => {
       temperature: 0.7
     })
   });
-
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(`Groq API error (${res.status}): ${errText}`);
   }
-
   const data = await res.json();
   return data.choices[0].message.content.trim();
 };
@@ -51,4 +49,21 @@ const generateTags = async (topic) => {
   return raw.split(',').map((t) => t.trim().replace(/^#/, '')).filter(Boolean);
 };
 
-module.exports = { generateTitle, generateDescription, generateTags };
+// Generates a short, natural-sounding app review based on a star rating —
+// used to auto-fill the Rate Us screen so the user has something to start from.
+const generateReviewText = async (stars) => {
+  const tone = stars >= 4
+    ? 'positive and appreciative'
+    : stars === 3
+      ? 'neutral, balanced, mentioning room for improvement'
+      : 'constructive but polite, focused on what could be better';
+
+  const raw = await callGroq(
+    `You are writing a short, natural, first-person app store review for a YouTube upload/scheduling app called TubePilot, ` +
+    `based on a star rating out of 5. The tone should be ${tone}. Reply with ONLY the review text, 1-2 sentences, no quotes, no hashtags.`,
+    `Star rating: ${stars} out of 5`
+  );
+  return raw.replace(/^["']|["']$/g, '');
+};
+
+module.exports = { generateTitle, generateDescription, generateTags, generateReviewText };

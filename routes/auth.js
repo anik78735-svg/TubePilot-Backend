@@ -46,6 +46,10 @@ router.post('/signup', async (req, res) => {
     const userId = await generateUserId();
     const referralCode = await generateReferralCode(userId);
 
+    // No starter diamond bonus here — diamondBalance defaults to 0 (see
+    // models/User.js). Diamonds are only granted when the user applies a
+    // valid referral code via POST /api/auth/apply-referral. If they skip
+    // entering a referral code, they simply stay at 0 diamonds.
     const user = await User.create({
       userId,
       name: name || '',
@@ -54,7 +58,6 @@ router.post('/signup', async (req, res) => {
       authProvider: 'local',
       referralCode,
       referredBy: referredBy || null,
-      diamondBalance: 10,
       freeUploadsRemaining: Number(process.env.FREE_UPLOADS_PER_MONTH || 20)
     });
 
@@ -106,6 +109,8 @@ router.post('/google', async (req, res) => {
     if (!user) {
       const userId = await generateUserId();
       const referralCode = await generateReferralCode(userId);
+      // Same as local signup — no starter diamond bonus. diamondBalance
+      // defaults to 0 (see models/User.js) until a referral code is applied.
       user = await User.create({
         userId,
         name: payload.name,
@@ -207,10 +212,17 @@ router.post('/setup-username', protect, async (req, res) => {
 });
 
 // @route POST /api/auth/apply-referral  { referralCode }
-// Called once, typically right after signup. Both the new user and the
-// referrer get a small diamond bonus. Real logic — validates the code
-// belongs to someone else and hasn't already been used by this user.
-const REFERRAL_BONUS_DIAMONDS = 5;
+// Called once, typically right after signup (e.g. during the "enter referral
+// code or skip" onboarding step). Both the new user and the referrer get a
+// diamond bonus. Real logic — validates the code belongs to someone else and
+// hasn't already been used by this user.
+//
+// The NEW user only ever receives diamonds through this route — signup
+// itself grants 0 diamonds (see models/User.js default + routes/auth.js
+// signup/google routes). If the user skips entering a referral code, this
+// route is simply never called and they stay at 0 diamonds.
+const REFERRAL_SIGNUP_BONUS_DIAMONDS = 10; // what the NEW user gets for entering a valid referral code
+const REFERRER_BONUS_DIAMONDS = 5;          // what the referrer gets when their code is used
 
 router.post('/apply-referral', protect, async (req, res) => {
   try {
@@ -230,15 +242,15 @@ router.post('/apply-referral', protect, async (req, res) => {
     }
 
     req.user.referredBy = referrer.userId;
-    req.user.diamondBalance += REFERRAL_BONUS_DIAMONDS;
+    req.user.diamondBalance += REFERRAL_SIGNUP_BONUS_DIAMONDS;
     await req.user.save();
 
-    referrer.diamondBalance += REFERRAL_BONUS_DIAMONDS;
+    referrer.diamondBalance += REFERRER_BONUS_DIAMONDS;
     await referrer.save();
 
     res.json({
       success: true,
-      message: `Referral applied! You both received ${REFERRAL_BONUS_DIAMONDS} bonus diamonds.`,
+      message: `Referral applied! You received ${REFERRAL_SIGNUP_BONUS_DIAMONDS} bonus diamonds, and your referrer received ${REFERRER_BONUS_DIAMONDS}.`,
       diamondBalance: req.user.diamondBalance
     });
   } catch (err) {

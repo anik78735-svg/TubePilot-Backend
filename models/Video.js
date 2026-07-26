@@ -10,7 +10,6 @@ const VideoSchema = new mongoose.Schema({
   playlist: { type: String, default: '' },
   audience: { type: String, enum: ['made_for_kids', 'not_for_kids'], default: 'not_for_kids' },
   privacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: 'public' },
-
   targetPrivacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: null },
 
   thumbnailUrl: { type: String, default: '' },
@@ -19,7 +18,6 @@ const VideoSchema = new mongoose.Schema({
   storageFileId: { type: String, default: '' },
   storageUrl: { type: String, default: '' },
   fileSizeBytes: { type: Number, default: 0 },
-
   storageDeleteAt: { type: Date, default: null },
 
   scheduledAt: { type: Date, default: null },

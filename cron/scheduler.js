@@ -8,7 +8,7 @@ const { refreshAccessToken, uploadVideoToYouTube, setThumbnail, updateVideoPriva
 const { getDriveFileStream, deleteDriveFile } = require('../utils/googleDrive');
 const { deleteFromCloudinary, account1, account2 } = require('../utils/cloudinary');
 
-const STORAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
+const STORAGE_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 const getVideoStream = async (video) => {
   if (video.storageProvider === 'google_drive') {
@@ -131,7 +131,6 @@ const startScheduler = () => {
       console.error('Scheduler tick error:', err.message);
     }
   });
-
   console.log('⏰ Upload scheduler is running (checks every minute)');
 };
 
@@ -188,7 +187,6 @@ const startPrivacyPublishScheduler = () => {
       console.error('Privacy publish scheduler tick error:', err.message);
     }
   });
-
   console.log('🌐 Privacy publish scheduler is running (checks every minute)');
 };
 
@@ -210,7 +208,6 @@ const startStorageCleanupScheduler = () => {
       console.error('Storage cleanup scheduler tick error:', err.message);
     }
   });
-
   console.log('🗑️  Storage cleanup scheduler is running (every 15 minutes, 24h retention)');
 };
 
@@ -237,7 +234,6 @@ const startFreeUploadReset = () => {
       console.error('Free upload reset error:', err.message);
     }
   });
-
   console.log('📅 Monthly free-upload reset job is running');
 };
 

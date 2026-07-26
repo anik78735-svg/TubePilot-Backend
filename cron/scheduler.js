@@ -8,25 +8,16 @@ const { refreshAccessToken, uploadVideoToYouTube, setThumbnail, updateVideoPriva
 const { getDriveFileStream, deleteDriveFile } = require('../utils/googleDrive');
 const { deleteFromCloudinary, account1, account2 } = require('../utils/cloudinary');
 
-// Returns a readable stream for the stored video file regardless of which
-// storage tier it landed on (Cloudinary 1/2 or Google Drive).
+const STORAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
+
 const getVideoStream = async (video) => {
   if (video.storageProvider === 'google_drive') {
     return getDriveFileStream(video.storageFileId);
   }
-  // Cloudinary: stream the file straight from its secure URL
   const response = await axios.get(video.storageUrl, { responseType: 'stream' });
   return response.data;
 };
 
-// Permanently removes the video file from whichever storage tier it was on.
-// Called once the video has been successfully pushed to YouTube — we don't
-// need to keep our own copy anymore, and this keeps user data minimal
-// (matches the app's Privacy Policy: videos aren't retained after upload).
-// Failure here is logged but never fails the overall upload — the YouTube
-// video is already live, so we don't want to mark it as failed just because
-// cleanup didn't succeed. `video.storageUrl` is only cleared on success, so
-// a failed cleanup can be noticed/retried later by an admin if needed.
 const deleteStoredVideoFile = async (video) => {
   try {
     if (video.storageProvider === 'cloudinary_1') {
@@ -36,9 +27,10 @@ const deleteStoredVideoFile = async (video) => {
     } else if (video.storageProvider === 'google_drive') {
       await deleteDriveFile(video.storageFileId);
     } else {
-      return; // no storage provider recorded, nothing to delete
+      return;
     }
     video.storageUrl = '';
+    video.storageDeleteAt = null;
   } catch (err) {
     console.error(`Failed to delete stored file for video ${video._id}:`, err.message);
   }
@@ -87,10 +79,7 @@ const processVideo = async (video) => {
     video.status = 'uploaded';
     video.youtubeVideoId = result.id;
     video.youtubeUrl = `https://youtube.com/watch?v=${result.id}`;
-
-    // Video is now live on YouTube — our own storage copy is redundant.
-    // Delete it so we don't retain user video files longer than necessary.
-    await deleteStoredVideoFile(video);
+    video.storageDeleteAt = new Date(Date.now() + STORAGE_RETENTION_MS);
 
     await video.save();
 
@@ -131,12 +120,10 @@ const processVideo = async (video) => {
   }
 };
 
-// Runs every minute: uploads any freshly-queued video immediately.
 const startScheduler = () => {
   cron.schedule('* * * * *', async () => {
     try {
       const dueVideos = await Video.find({ status: 'queued' }).limit(10);
-
       for (const video of dueVideos) {
         await processVideo(video);
       }
@@ -148,9 +135,6 @@ const startScheduler = () => {
   console.log('⏰ Upload scheduler is running (checks every minute)');
 };
 
-// Flips an already-uploaded, currently-unlisted video to 'public' on YouTube
-// once its scheduledAt time arrives. Does NOT re-upload the file (the file
-// no longer exists in our storage anyway — see deleteStoredVideoFile above).
 const processPrivacyPublish = async (video) => {
   const user = await User.findById(video.user);
   if (!user || !user.youtubeChannel) {
@@ -186,8 +170,6 @@ const processPrivacyPublish = async (video) => {
   }
 };
 
-// Runs every minute: finds uploaded-but-still-unlisted videos whose
-// scheduled "go public" time has arrived, and publishes them.
 const startPrivacyPublishScheduler = () => {
   cron.schedule('* * * * *', async () => {
     try {
@@ -210,7 +192,28 @@ const startPrivacyPublishScheduler = () => {
   console.log('🌐 Privacy publish scheduler is running (checks every minute)');
 };
 
-// Monthly free-upload reset: runs once a day, resets any user whose reset date has passed
+const startStorageCleanupScheduler = () => {
+  cron.schedule('*/15 * * * *', async () => {
+    try {
+      const now = new Date();
+      const dueVideos = await Video.find({
+        status: 'uploaded',
+        storageUrl: { $ne: '' },
+        storageDeleteAt: { $lte: now }
+      }).limit(25);
+
+      for (const video of dueVideos) {
+        await deleteStoredVideoFile(video);
+        await video.save();
+      }
+    } catch (err) {
+      console.error('Storage cleanup scheduler tick error:', err.message);
+    }
+  });
+
+  console.log('🗑️  Storage cleanup scheduler is running (every 15 minutes, 24h retention)');
+};
+
 const startFreeUploadReset = () => {
   cron.schedule('0 0 * * *', async () => {
     try {
@@ -238,4 +241,4 @@ const startFreeUploadReset = () => {
   console.log('📅 Monthly free-upload reset job is running');
 };
 
-module.exports = { startScheduler, startFreeUploadReset, startPrivacyPublishScheduler };
+module.exports = { startScheduler, startFreeUploadReset, startPrivacyPublishScheduler, startStorageCleanupScheduler };

@@ -5,6 +5,7 @@ const Video = require('../models/Video');
 const Notification = require('../models/Notification');
 const { pickAvailableCloudinaryAccount, uploadBufferToCloudinary } = require('../utils/cloudinary');
 const { uploadBufferToDrive } = require('../utils/googleDrive');
+const { sendOneSignalToUser } = require('../utils/oneSignalPush');
 
 const router = express.Router();
 
@@ -122,6 +123,15 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
     res.status(201).json({ success: true, video });
   } catch (err) {
     if (err.code === 'INSUFFICIENT_DIAMONDS') {
+      // Free uploads + diamonds are both exhausted — nudge the user via
+      // OneSignal to buy more diamonds. This does NOT touch Firebase push
+      // notifications used elsewhere in the app (utils/push.js), and it
+      // never blocks or delays the error response sent back to the client.
+      sendOneSignalToUser(req.user, {
+        title: 'Your credits are over 💎',
+        body: 'Your free uploads and diamonds are used up. Please buy diamonds to upload your video.',
+        data: { type: 'insufficient_diamonds' }
+      }).catch(() => {});
       return res.status(402).json({ success: false, message: err.message, code: err.code });
     }
     res.status(500).json({ success: false, message: err.message });

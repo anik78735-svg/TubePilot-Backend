@@ -29,6 +29,7 @@ const UserSchema = new mongoose.Schema({
   freeUploadsResetAt: { type: Date, default: () => new Date(new Date().setMonth(new Date().getMonth() + 1)) },
   storageUsedBytes: { type: Number, default: 0 },
   fcmTokens: [{ type: String }],
+  oneSignalPlayerIds: [{ type: String }], // used only for the "diamonds exhausted, please buy more" alert via OneSignal
   youtubeChannel: { type: YouTubeChannelSchema, default: null },
   subscription: {
     isActive: { type: Boolean, default: false },

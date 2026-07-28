@@ -213,3 +213,8 @@ router.delete('/:id', protect, async (req, res) => {
 });
 
 module.exports = router;
+// NEW: exported alongside the router (a router is just a function, so extra
+// properties can safely hang off it) so cron/scheduler.js can reuse the exact
+// same charge + storage logic for Drive auto-uploads, instead of duplicating it.
+module.exports.chargeForUpload = chargeForUpload;
+module.exports.storeVideoFile = storeVideoFile;

@@ -4,9 +4,11 @@ const Video = require('../models/Video');
 const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
+const { sendOneSignalToUser } = require('../utils/oneSignalPush');
 const { refreshAccessToken, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy } = require('../utils/youtube');
-const { getDriveFileStream, deleteDriveFile } = require('../utils/googleDrive');
+const { getDriveFileStream, deleteDriveFile, listUserDriveVideoFiles, downloadUserDriveFileBuffer } = require('../utils/googleDrive');
 const { deleteFromCloudinary, account1, account2 } = require('../utils/cloudinary');
+const { chargeForUpload, storeVideoFile } = require('../routes/video');
 
 const STORAGE_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -237,4 +239,108 @@ const startFreeUploadReset = () => {
   console.log('📅 Monthly free-upload reset job is running');
 };
 
-module.exports = { startScheduler, startFreeUploadReset, startPrivacyPublishScheduler, startStorageCleanupScheduler };
+// ---------------- NEW: Google Drive daily auto-upload ----------------
+// For one user: picks the OLDEST not-yet-processed video file from their
+// connected Drive, charges a free-upload/diamond credit exactly like a
+// manual upload does, copies it into our own storage (Cloudinary/system
+// Drive) via the existing storeVideoFile(), and creates a 'queued' Video
+// document — which the existing startScheduler() cron above then uploads to
+// YouTube automatically, with zero changes to that pipeline.
+const runDriveAutoUploadForUser = async (user, todayStr) => {
+  try {
+    if (!user.youtubeChannel) {
+      // Nothing we can do today without a connected YouTube channel — mark
+      // today as attempted so we don't retry every minute, and try again tomorrow.
+      user.connectedDrive.lastAutoUploadDate = todayStr;
+      await user.save();
+      return;
+    }
+
+    const files = await listUserDriveVideoFiles(user);
+    const processedIds = user.connectedDrive.driveProcessedFileIds || [];
+    const nextFile = files.find((f) => !processedIds.includes(f.id));
+
+    // Mark today as attempted regardless of outcome below, so this user's
+    // scheduled time only fires once per day.
+    user.connectedDrive.lastAutoUploadDate = todayStr;
+
+    if (!nextFile) {
+      await user.save();
+      return;
+    }
+
+    let charge;
+    try {
+      charge = chargeForUpload(user);
+    } catch (err) {
+      await user.save();
+      if (err.code === 'INSUFFICIENT_DIAMONDS') {
+        sendOneSignalToUser(user, {
+          title: 'Your credits are over 💎',
+          body: 'Your free uploads and diamonds are used up. Please buy diamonds to continue Drive auto-upload.',
+          data: { type: 'insufficient_diamonds' }
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    const buffer = await downloadUserDriveFileBuffer(user, nextFile.id);
+    const stored = await storeVideoFile(buffer, `${user.userId}_drive_${Date.now()}`, nextFile.mimeType || 'video/mp4');
+
+    await Video.create({
+      user: user._id,
+      title: nextFile.name || 'Untitled',
+      description: '',
+      tags: [],
+      category: '22',
+      audience: 'not_for_kids',
+      privacyStatus: 'public',
+      targetPrivacyStatus: 'public',
+      storageProvider: stored.storageProvider,
+      storageFileId: stored.storageFileId,
+      storageUrl: stored.storageUrl,
+      fileSizeBytes: Number(nextFile.size) || buffer.length,
+      status: 'queued',
+      diamondsCharged: charge.diamondsCharged,
+      usedFreeUpload: charge.usedFreeUpload,
+      sourceProvider: 'drive_auto',
+      sourceDriveFileId: nextFile.id
+    });
+
+    user.storageUsedBytes += buffer.length;
+    user.connectedDrive.driveProcessedFileIds = [...processedIds, nextFile.id];
+    await user.save();
+  } catch (err) {
+    console.error(`Drive auto-upload failed for user ${user._id}:`, err.message);
+  }
+};
+
+const startDriveAutoUploadScheduler = () => {
+  cron.schedule('* * * * *', async () => {
+    try {
+      const now = new Date();
+      const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+      const todayStr = now.toISOString().slice(0, 10);
+
+      const dueUsers = await User.find({
+        'connectedDrive.dailyUploadTime': hhmm,
+        'connectedDrive.lastAutoUploadDate': { $ne: todayStr }
+      });
+
+      for (const user of dueUsers) {
+        await runDriveAutoUploadForUser(user, todayStr);
+      }
+    } catch (err) {
+      console.error('Drive auto-upload scheduler tick error:', err.message);
+    }
+  });
+  console.log('📁 Drive auto-upload scheduler is running (checks every minute)');
+};
+
+module.exports = {
+  startScheduler,
+  startFreeUploadReset,
+  startPrivacyPublishScheduler,
+  startStorageCleanupScheduler,
+  startDriveAutoUploadScheduler
+};

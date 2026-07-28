@@ -1,8 +1,11 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { protect } = require('../middleware/auth');
-const { getOAuthClient, exchangeCodeForTokens } = require('../utils/youtube');
-const { getUserDriveAccountInfo } = require('../utils/googleDrive');
+const {
+  getDriveOAuthClient,
+  exchangeCodeForDriveTokens,
+  getUserDriveAccountInfo
+} = require('../utils/googleDrive');
 const User = require('../models/User');
 
 const router = express.Router();
@@ -14,7 +17,7 @@ const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
 
 // @route GET /api/drive/oauth/url?platform=mobile|web
 router.get('/oauth/url', protect, (req, res) => {
-  const oauth2Client = getOAuthClient();
+  const oauth2Client = getDriveOAuthClient();
   const platform = req.query.platform === 'mobile' ? 'mobile' : 'web';
   const state = jwt.sign({ id: req.user._id, platform }, process.env.JWT_SECRET, { expiresIn: '10m' });
   const url = oauth2Client.generateAuthUrl({
@@ -36,7 +39,7 @@ router.get('/oauth/callback', async (req, res) => {
     const user = await User.findById(decoded.id);
     if (!user) throw new Error('User not found');
 
-    const tokens = await exchangeCodeForTokens(code);
+    const tokens = await exchangeCodeForDriveTokens(code);
     const accountInfo = await getUserDriveAccountInfo(tokens.access_token);
 
     user.connectedDrive = {

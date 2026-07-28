@@ -5,10 +5,17 @@ const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/db');
-const { startScheduler, startFreeUploadReset, startPrivacyPublishScheduler, startStorageCleanupScheduler } = require('./cron/scheduler');
+const {
+  startScheduler,
+  startFreeUploadReset,
+  startPrivacyPublishScheduler,
+  startStorageCleanupScheduler,
+  startDriveAutoUploadScheduler
+} = require('./cron/scheduler');
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
 const youtubeRoutes = require('./routes/youtube');
+const driveRoutes = require('./routes/drive');
 const videoRoutes = require('./routes/video');
 const diamondRoutes = require('./routes/diamond');
 const walletRoutes = require('./routes/wallet');
@@ -45,6 +52,7 @@ app.use('/api/auth/signup', authLimiter);
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/youtube', youtubeRoutes);
+app.use('/api/drive', driveRoutes);
 app.use('/api/videos', videoRoutes);
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/wallet', walletRoutes);
@@ -92,6 +100,7 @@ const start = async () => {
     startFreeUploadReset();
     startPrivacyPublishScheduler();
     startStorageCleanupScheduler();
+    startDriveAutoUploadScheduler();
     startKeepAlivePing();
   });
 };

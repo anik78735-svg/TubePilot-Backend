@@ -20,6 +20,18 @@ const VideoSchema = new mongoose.Schema({
   fileSizeBytes: { type: Number, default: 0 },
   storageDeleteAt: { type: Date, default: null },
 
+  // Where this Video document originated from. 'manual' = user uploaded via
+  // the app directly. 'drive_auto' = picked up automatically by
+  // cron/scheduler.js's Drive auto-upload job from the user's connected
+  // Google Drive. sourceDriveFileId is the ORIGINAL file id in the user's
+  // own Drive (kept only for reference/history) — this is intentionally
+  // separate from storageFileId/storageProvider, which always point to OUR
+  // internal storage copy (Cloudinary/system-Drive), so the storage cleanup
+  // job (deleteStoredVideoFile in cron/scheduler.js) can never delete the
+  // user's original file sitting in their own Drive.
+  sourceProvider: { type: String, enum: ['manual', 'drive_auto'], default: 'manual' },
+  sourceDriveFileId: { type: String, default: '' },
+
   scheduledAt: { type: Date, default: null },
 
   status: {

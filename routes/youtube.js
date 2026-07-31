@@ -48,6 +48,10 @@ router.get('/oauth/callback', async (req, res) => {
     const tokens = await exchangeCodeForTokens(code);
     const channel = await getChannelInfo(tokens.access_token);
 
+    if (!channel) {
+      throw new Error('No YouTube channel found on this Google account');
+    }
+
     user.youtubeChannel = {
       channelId: channel.id,
       channelTitle: channel.snippet.title,
@@ -68,6 +72,12 @@ router.get('/oauth/callback', async (req, res) => {
       res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?youtube_connected=1`);
     }
   } catch (err) {
+    // Logged with full detail so Render logs show the real cause
+    // (redirect_uri_mismatch, invalid_grant, missing test-user access, etc.)
+    // instead of just a generic "failed to connect" toast in the app.
+    console.error('❌ YouTube OAuth callback failed:', err.message);
+    console.error(err.stack);
+
     if (platform === 'mobile') {
       res.redirect(`tubepilot://oauth-success?youtube_connected=0&error=${encodeURIComponent(err.message)}`);
     } else {

@@ -16,6 +16,8 @@ const PRIMARY_FRONTEND_URL = (process.env.FRONTEND_URL || '').split(',')[0].trim
 const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
 const DRIVE_RECONNECT_DIAMOND_COST = Number(process.env.DRIVE_RECONNECT_DIAMOND_COST || 30);
 
+console.log(`ℹ️  Google Drive OAuth redirect URI configured as: ${process.env.GOOGLE_DRIVE_REDIRECT_URI || '⚠️ EMPTY — check GOOGLE_DRIVE_REDIRECT_URI in .env'}`);
+
 // @route GET /api/drive/oauth/url?platform=mobile|web
 router.get('/oauth/url', protect, (req, res) => {
   const oauth2Client = getDriveOAuthClient();
@@ -91,6 +93,11 @@ router.get('/oauth/callback', async (req, res) => {
       res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?drive_connected=1`);
     }
   } catch (err) {
+    // Logged with full detail so Render logs show the real cause
+    // (redirect_uri_mismatch on GOOGLE_DRIVE_REDIRECT_URI, invalid_grant, etc.)
+    console.error('❌ Google Drive OAuth callback failed:', err.message);
+    console.error(err.stack);
+
     if (platform === 'mobile') {
       res.redirect(`tubepilot://oauth-success?drive_connected=0&error=${encodeURIComponent(err.message)}`);
     } else {

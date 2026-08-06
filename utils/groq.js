@@ -18,10 +18,12 @@ const callGroq = async (systemPrompt, userPrompt) => {
       temperature: 0.7
     })
   });
+
   if (!res.ok) {
     const errText = await res.text();
     throw new Error(`Groq API error (${res.status}): ${errText}`);
   }
+
   const data = await res.json();
   return data.choices[0].message.content.trim();
 };
@@ -49,21 +51,31 @@ const generateTags = async (topic) => {
   return raw.split(',').map((t) => t.trim().replace(/^#/, '')).filter(Boolean);
 };
 
-// Generates a short, natural-sounding app review based on a star rating —
-// used to auto-fill the Rate Us screen so the user has something to start from.
-const generateReviewText = async (stars) => {
-  const tone = stars >= 4
-    ? 'positive and appreciative'
-    : stars === 3
-      ? 'neutral, balanced, mentioning room for improvement'
-      : 'constructive but polite, focused on what could be better';
-
-  const raw = await callGroq(
-    `You are writing a short, natural, first-person app store review for a YouTube upload/scheduling app called TubePilot, ` +
-    `based on a star rating out of 5. The tone should be ${tone}. Reply with ONLY the review text, 1-2 sentences, no quotes, no hashtags.`,
-    `Star rating: ${stars} out of 5`
-  );
-  return raw.replace(/^["']|["']$/g, '');
+// Platform-aware caption generator. Instagram and Facebook have different
+// tone/length conventions, so the system prompt is branched per platform
+// rather than reusing the YouTube description generator — this is what
+// keeps captions from ever being a copy of the YouTube title/description.
+const CAPTION_PROMPTS = {
+  instagram: 'You are a social media copywriter specializing in Instagram Reels. Write a short, punchy, engaging caption (1-3 sentences, conversational tone, can include 1-2 emojis) that hooks viewers in the first line. Reply with ONLY the caption text, no hashtags.',
+  facebook: 'You are a social media copywriter specializing in Facebook video posts. Write a friendly, slightly longer caption (2-4 sentences) that encourages comments and shares. Reply with ONLY the caption text, no hashtags.'
 };
 
-module.exports = { generateTitle, generateDescription, generateTags, generateReviewText };
+const generateCaption = async (topic, platform) => {
+  const systemPrompt = CAPTION_PROMPTS[platform] || CAPTION_PROMPTS.instagram;
+  return callGroq(systemPrompt, `Video/Reel topic: ${topic}`);
+};
+
+// Platform-aware hashtag generator. Instagram favors more hashtags than
+// Facebook, per each platform's own best-practice conventions.
+const HASHTAG_PROMPTS = {
+  instagram: 'You are a social media growth expert specializing in Instagram Reels. Reply with ONLY a comma-separated list of 20 relevant, trending Instagram hashtags for the given topic (mix of broad and niche tags). No numbering, no extra text, no # symbol.',
+  facebook: 'You are a social media growth expert specializing in Facebook video posts. Reply with ONLY a comma-separated list of 8 relevant Facebook hashtags for the given topic. No numbering, no extra text, no # symbol.'
+};
+
+const generateHashtags = async (topic, platform) => {
+  const systemPrompt = HASHTAG_PROMPTS[platform] || HASHTAG_PROMPTS.instagram;
+  const raw = await callGroq(systemPrompt, `Video/Reel topic: ${topic}`);
+  return raw.split(',').map((t) => t.trim().replace(/^#/, '')).filter(Boolean);
+};
+
+module.exports = { generateTitle, generateDescription, generateTags, generateCaption, generateHashtags };

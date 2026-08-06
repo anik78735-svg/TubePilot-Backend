@@ -5,32 +5,27 @@ const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
 const { sendOneSignalToUser } = require('../utils/oneSignalPush');
-const { refreshAccessToken, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy } = require('../utils/youtube');
+const { refreshAccessToken, uploadVideoToYouTube } = require('../utils/youtube');
 const { getDriveFileStream, deleteDriveFile, listUserDriveVideoFiles, downloadUserDriveFileBuffer } = require('../utils/googleDrive');
+const { publishFacebookReel, publishInstagramReel } = require('../utils/meta');
 const { deleteFromCloudinary, account1, account2 } = require('../utils/cloudinary');
 const { chargeForUpload, storeVideoFile } = require('../routes/video');
 
-const STORAGE_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_RETRIES = 3;
 
-const getVideoStream = async (video) => {
-  if (video.storageProvider === 'google_drive') {
-    return getDriveFileStream(video.storageFileId);
-  }
+// ---------------- Shared storage helpers ----------------
+
+const getVideoFileStream = async (video) => {
+  if (video.storageProvider === 'google_drive') return getDriveFileStream(video.storageFileId);
   const response = await axios.get(video.storageUrl, { responseType: 'stream' });
   return response.data;
 };
 
 const deleteStoredVideoFile = async (video) => {
   try {
-    if (video.storageProvider === 'cloudinary_1') {
-      await deleteFromCloudinary(account1, video.storageFileId);
-    } else if (video.storageProvider === 'cloudinary_2') {
-      await deleteFromCloudinary(account2, video.storageFileId);
-    } else if (video.storageProvider === 'google_drive') {
-      await deleteDriveFile(video.storageFileId);
-    } else {
-      return;
-    }
+    if (video.storageProvider === 'cloudinary_1') await deleteFromCloudinary(account1, video.storageFileId);
+    else if (video.storageProvider === 'cloudinary_2') await deleteFromCloudinary(account2, video.storageFileId);
+    else if (video.storageProvider === 'google_drive') await deleteDriveFile(video.storageFileId);
     video.storageUrl = '';
     video.storageDeleteAt = null;
   } catch (err) {
@@ -38,11 +33,10 @@ const deleteStoredVideoFile = async (video) => {
   }
 };
 
-const ensureFreshAccessToken = async (user) => {
+const ensureFreshYouTubeToken = async (user) => {
   const channel = user.youtubeChannel;
   const isExpired = !channel.tokenExpiryDate || Date.now() > channel.tokenExpiryDate - 60000;
   if (!isExpired) return channel.accessToken;
-
   const credentials = await refreshAccessToken(channel.refreshToken);
   user.youtubeChannel.accessToken = credentials.access_token;
   user.youtubeChannel.tokenExpiryDate = credentials.expiry_date;
@@ -50,181 +44,178 @@ const ensureFreshAccessToken = async (user) => {
   return credentials.access_token;
 };
 
-const processVideo = async (video) => {
-  const user = await User.findById(video.user);
-  if (!user || !user.youtubeChannel) {
-    video.status = 'failed';
-    video.failReason = 'No YouTube channel connected';
-    await video.save();
-    return;
-  }
+// ---------------- Per-platform publish ----------------
 
-  try {
-    video.status = 'processing';
-    await video.save();
-
-    const accessToken = await ensureFreshAccessToken(user);
-    const fileStream = await getVideoStream(video);
-
-    const result = await uploadVideoToYouTube({
-      accessToken,
-      refreshToken: user.youtubeChannel.refreshToken,
-      fileStream,
-      title: video.title,
-      description: video.description,
-      tags: video.tags,
-      categoryId: video.category,
-      privacyStatus: video.privacyStatus || 'public',
-      madeForKids: video.audience === 'made_for_kids'
-    });
-
-    video.status = 'uploaded';
-    video.youtubeVideoId = result.id;
-    video.youtubeUrl = `https://youtube.com/watch?v=${result.id}`;
-    video.storageDeleteAt = new Date(Date.now() + STORAGE_RETENTION_MS);
-
-    await video.save();
-
-    const privacyLabel = video.privacyStatus === 'public' ? 'public' : video.privacyStatus;
-    const willGoPublicLater = video.targetPrivacyStatus === 'public' && video.privacyStatus !== 'public';
-    await Notification.create({
-      user: user._id,
-      type: 'upload_completed',
-      title: 'Upload Completed ✅',
-      message: willGoPublicLater
-        ? `"${video.title}" is uploaded (unlisted) and will go public at the scheduled time.`
-        : `"${video.title}" is now live on YouTube (${privacyLabel}).`
-    });
-    await sendPushToUser(user, {
-      title: 'Your video is live! 🎉',
-      body: willGoPublicLater
-        ? `"${video.title}" is uploaded and scheduled to go public soon.`
-        : `"${video.title}" just went ${privacyLabel} on YouTube.`,
-      data: { type: 'upload_completed', videoId: video._id.toString(), youtubeUrl: video.youtubeUrl }
-    });
-  } catch (err) {
-    console.error(`Upload failed for video ${video._id}:`, err.message);
-    video.status = 'failed';
-    video.failReason = err.message;
-    await video.save();
-
-    await Notification.create({
-      user: user._id,
-      type: 'upload_failed',
-      title: 'Upload Failed ❌',
-      message: `"${video.title}" failed to upload: ${err.message}`
-    });
-    await sendPushToUser(user, {
-      title: 'Upload failed ❌',
-      body: `"${video.title}" couldn't be uploaded. Tap to see why.`,
-      data: { type: 'upload_failed', videoId: video._id.toString() }
-    });
-  }
-};
-
-const startScheduler = () => {
-  cron.schedule('* * * * *', async () => {
-    try {
-      const dueVideos = await Video.find({ status: 'queued' }).limit(10);
-      for (const video of dueVideos) {
-        await processVideo(video);
-      }
-    } catch (err) {
-      console.error('Scheduler tick error:', err.message);
-    }
+const publishToYouTube = async (video, target, user) => {
+  const accessToken = await ensureFreshYouTubeToken(user);
+  const fileStream = await getVideoFileStream(video);
+  const result = await uploadVideoToYouTube({
+    accessToken,
+    refreshToken: user.youtubeChannel.refreshToken,
+    fileStream,
+    title: target.title,
+    description: target.description,
+    tags: target.tags,
+    categoryId: target.category,
+    privacyStatus: target.privacyStatus || 'public',
+    madeForKids: target.audience === 'made_for_kids'
   });
-  console.log('⏰ Upload scheduler is running (checks every minute)');
+  return { platformPostId: result.id, platformUrl: `https://youtube.com/watch?v=${result.id}` };
 };
 
-const processPrivacyPublish = async (video) => {
-  const user = await User.findById(video.user);
-  if (!user || !user.youtubeChannel) {
-    console.error(`Privacy publish skipped for video ${video._id}: no YouTube channel connected`);
-    return;
+const publishToInstagram = async (video, target, user) => {
+  if (!user.connectedInstagram || !user.connectedFacebook) {
+    throw new Error('Instagram is not connected');
   }
+  const caption = [target.caption, ...(target.hashtags || []).map((h) => `#${h.replace(/^#/, '')}`)].filter(Boolean).join('\n\n');
+  return publishInstagramReel({
+    igUserId: user.connectedInstagram.igUserId,
+    pageAccessToken: user.connectedFacebook.pageAccessToken,
+    videoUrl: video.storageUrl,
+    caption
+  });
+};
 
-  try {
-    const accessToken = await ensureFreshAccessToken(user);
-    await updateVideoPrivacy({
-      accessToken,
-      refreshToken: user.youtubeChannel.refreshToken,
-      videoId: video.youtubeVideoId,
-      privacyStatus: 'public'
-    });
+const publishToFacebook = async (video, target, user) => {
+  if (!user.connectedFacebook) throw new Error('Facebook is not connected');
+  const caption = [target.caption, ...(target.hashtags || []).map((h) => `#${h.replace(/^#/, '')}`)].filter(Boolean).join('\n\n');
+  return publishFacebookReel({
+    pageId: user.connectedFacebook.pageId,
+    pageAccessToken: user.connectedFacebook.pageAccessToken,
+    videoUrl: video.storageUrl,
+    caption
+  });
+};
 
-    video.privacyStatus = 'public';
+const PUBLISHERS = { youtube: publishToYouTube, instagram: publishToInstagram, facebook: publishToFacebook };
+
+const PLATFORM_LABELS = { youtube: 'YouTube', instagram: 'Instagram Reels', facebook: 'Facebook Reels' };
+
+// Processes every 'queued' platform target on one Video document. Each
+// target is independent: one platform failing never blocks or re-triggers
+// the others (e.g. YouTube succeeds, Instagram fails -> only Instagram is
+// retried later; Facebook, if also queued, is attempted regardless of what
+// happened to the other two in this same pass).
+const processVideoTargets = async (video) => {
+  const user = await User.findById(video.user);
+  if (!user) return;
+
+  const targets = video.platforms.filter((t) => t.status === 'queued');
+  for (const target of targets) {
+    target.status = 'processing';
     await video.save();
 
-    await Notification.create({
-      user: user._id,
-      type: 'upload_completed',
-      title: 'Video Is Now Public 🌐',
-      message: `"${video.title}" just went public on YouTube as scheduled.`
-    });
-    await sendPushToUser(user, {
-      title: 'Your video is now public! 🎉',
-      body: `"${video.title}" just went public on YouTube.`,
-      data: { type: 'upload_completed', videoId: video._id.toString(), youtubeUrl: video.youtubeUrl }
-    });
-  } catch (err) {
-    console.error(`Privacy publish failed for video ${video._id}:`, err.message);
+    try {
+      const publisher = PUBLISHERS[target.platform];
+      const result = await publisher(video, target, user);
+      target.status = 'uploaded';
+      target.platformPostId = result.platformPostId;
+      target.platformUrl = result.platformUrl;
+      target.failReason = '';
+
+      await Notification.create({
+        user: user._id,
+        type: 'upload_completed',
+        title: `${PLATFORM_LABELS[target.platform]} Upload Completed ✅`,
+        message: `Your video is now live on ${PLATFORM_LABELS[target.platform]}.`
+      });
+      await sendPushToUser(user, {
+        title: `Live on ${PLATFORM_LABELS[target.platform]}! 🎉`,
+        body: 'Your video just went live.',
+        data: { type: 'upload_completed', videoId: video._id.toString(), platform: target.platform, platformUrl: target.platformUrl }
+      });
+    } catch (err) {
+      console.error(`${target.platform} publish failed for video ${video._id}:`, err.message);
+      target.failReason = err.message;
+      target.retryCount += 1;
+      target.status = target.retryCount >= MAX_RETRIES ? 'failed' : 'failed'; // stays 'failed'; retry job re-queues it if under the limit
+
+      await Notification.create({
+        user: user._id,
+        type: 'upload_failed',
+        title: `${PLATFORM_LABELS[target.platform]} Upload Failed ❌`,
+        message: target.retryCount >= MAX_RETRIES
+          ? `Your video could not be published to ${PLATFORM_LABELS[target.platform]} after ${MAX_RETRIES} attempts: ${err.message}`
+          : `${PLATFORM_LABELS[target.platform]} upload failed, retrying automatically: ${err.message}`
+      });
+      await sendPushToUser(user, {
+        title: `${PLATFORM_LABELS[target.platform]} upload failed ❌`,
+        body: target.retryCount >= MAX_RETRIES ? 'Retries exhausted. Tap to see why.' : 'Retrying automatically...',
+        data: { type: 'upload_failed', videoId: video._id.toString(), platform: target.platform }
+      });
+    }
+
+    await video.save();
+  }
+
+  video.recomputeStatus();
+  await video.save();
+
+  // Once every target has reached a terminal state (uploaded, or failed with
+  // retries exhausted), the shared temp file is no longer needed by anyone —
+  // delete it immediately rather than waiting on a 24h retention window.
+  const stillNeedsFile = video.platforms.some((t) =>
+    t.status === 'pending' || t.status === 'queued' || t.status === 'processing' ||
+    (t.status === 'failed' && t.retryCount < MAX_RETRIES)
+  );
+  if (!stillNeedsFile && video.storageUrl) {
+    await deleteStoredVideoFile(video);
+    await video.save();
   }
 };
 
-const startPrivacyPublishScheduler = () => {
+const startPublishScheduler = () => {
   cron.schedule('* * * * *', async () => {
     try {
       const now = new Date();
-      const dueVideos = await Video.find({
-        status: 'uploaded',
-        targetPrivacyStatus: 'public',
-        privacyStatus: { $ne: 'public' },
-        scheduledAt: { $lte: now }
-      }).limit(10);
 
+      // Promote any 'pending' targets whose scheduled time has arrived into 'queued'.
+      await Video.updateMany(
+        { 'platforms.status': 'pending', 'platforms.scheduledAt': { $lte: now } },
+        { $set: { 'platforms.$[elem].status': 'queued' } },
+        { arrayFilters: [{ 'elem.status': 'pending', 'elem.scheduledAt': { $lte: now } }] }
+      );
+
+      const dueVideos = await Video.find({ 'platforms.status': 'queued' }).limit(10);
       for (const video of dueVideos) {
-        await processPrivacyPublish(video);
+        await processVideoTargets(video);
       }
     } catch (err) {
-      console.error('Privacy publish scheduler tick error:', err.message);
+      console.error('Publish scheduler tick error:', err.message);
     }
   });
-  console.log('🌐 Privacy publish scheduler is running (checks every minute)');
+  console.log('⏰ Multi-platform publish scheduler is running (checks every minute)');
 };
 
-const startStorageCleanupScheduler = () => {
+// Retries failed targets under the retry limit, with a short backoff so we
+// don't hammer a platform that's temporarily down. Runs every 15 minutes.
+const startRetryScheduler = () => {
   cron.schedule('*/15 * * * *', async () => {
     try {
-      const now = new Date();
-      const dueVideos = await Video.find({
-        status: 'uploaded',
-        storageUrl: { $ne: '' },
-        storageDeleteAt: { $lte: now }
-      }).limit(25);
-
-      for (const video of dueVideos) {
-        await deleteStoredVideoFile(video);
-        await video.save();
-      }
+      await Video.updateMany(
+        { 'platforms.status': 'failed', 'platforms.retryCount': { $lt: MAX_RETRIES } },
+        { $set: { 'platforms.$[elem].status': 'queued' } },
+        { arrayFilters: [{ 'elem.status': 'failed', 'elem.retryCount': { $lt: MAX_RETRIES } }] }
+      );
+      console.log('🔁 Retry scheduler promoted eligible failed targets back to queued');
     } catch (err) {
-      console.error('Storage cleanup scheduler tick error:', err.message);
+      console.error('Retry scheduler tick error:', err.message);
     }
   });
-  console.log('🗑️  Storage cleanup scheduler is running (every 15 minutes, 24h retention)');
+  console.log('🔁 Retry scheduler is running (every 15 minutes)');
 };
 
+// ---------------- Free upload monthly reset (unchanged) ----------------
 const startFreeUploadReset = () => {
   cron.schedule('0 0 * * *', async () => {
     try {
       const now = new Date();
       const dueUsers = await User.find({ freeUploadsResetAt: { $lte: now } });
       const freeLimit = Number(process.env.FREE_UPLOADS_PER_MONTH || 20);
-
       for (const user of dueUsers) {
         user.freeUploadsRemaining = freeLimit;
         user.freeUploadsResetAt = new Date(new Date().setMonth(new Date().getMonth() + 1));
         await user.save();
-
         await Notification.create({
           user: user._id,
           type: 'free_upload_reset',
@@ -239,18 +230,10 @@ const startFreeUploadReset = () => {
   console.log('📅 Monthly free-upload reset job is running');
 };
 
-// ---------------- NEW: Google Drive daily auto-upload ----------------
-// For one user: picks the OLDEST not-yet-processed video file from their
-// connected Drive, charges a free-upload/diamond credit exactly like a
-// manual upload does, copies it into our own storage (Cloudinary/system
-// Drive) via the existing storeVideoFile(), and creates a 'queued' Video
-// document — which the existing startScheduler() cron above then uploads to
-// YouTube automatically, with zero changes to that pipeline.
+// ---------------- Google Drive daily auto-upload (adapted to platforms[]) ----------------
 const runDriveAutoUploadForUser = async (user, todayStr) => {
   try {
     if (!user.youtubeChannel) {
-      // Nothing we can do today without a connected YouTube channel — mark
-      // today as attempted so we don't retry every minute, and try again tomorrow.
       user.connectedDrive.lastAutoUploadDate = todayStr;
       await user.save();
       return;
@@ -260,8 +243,6 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
     const processedIds = user.connectedDrive.driveProcessedFileIds || [];
     const nextFile = files.find((f) => !processedIds.includes(f.id));
 
-    // Mark today as attempted regardless of outcome below, so this user's
-    // scheduled time only fires once per day.
     user.connectedDrive.lastAutoUploadDate = todayStr;
 
     if (!nextFile) {
@@ -289,13 +270,6 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
 
     await Video.create({
       user: user._id,
-      title: nextFile.name || 'Untitled',
-      description: '',
-      tags: [],
-      category: '22',
-      audience: 'not_for_kids',
-      privacyStatus: 'public',
-      targetPrivacyStatus: 'public',
       storageProvider: stored.storageProvider,
       storageFileId: stored.storageFileId,
       storageUrl: stored.storageUrl,
@@ -304,7 +278,14 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
       diamondsCharged: charge.diamondsCharged,
       usedFreeUpload: charge.usedFreeUpload,
       sourceProvider: 'drive_auto',
-      sourceDriveFileId: nextFile.id
+      sourceDriveFileId: nextFile.id,
+      platforms: [{
+        platform: 'youtube',
+        status: 'queued',
+        title: nextFile.name || 'Untitled',
+        privacyStatus: 'public',
+        targetPrivacyStatus: 'public'
+      }]
     });
 
     user.storageUsedBytes += buffer.length;
@@ -321,12 +302,10 @@ const startDriveAutoUploadScheduler = () => {
       const now = new Date();
       const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
       const todayStr = now.toISOString().slice(0, 10);
-
       const dueUsers = await User.find({
         'connectedDrive.dailyUploadTime': hhmm,
         'connectedDrive.lastAutoUploadDate': { $ne: todayStr }
       });
-
       for (const user of dueUsers) {
         await runDriveAutoUploadForUser(user, todayStr);
       }
@@ -338,9 +317,8 @@ const startDriveAutoUploadScheduler = () => {
 };
 
 module.exports = {
-  startScheduler,
+  startPublishScheduler,
+  startRetryScheduler,
   startFreeUploadReset,
-  startPrivacyPublishScheduler,
-  startStorageCleanupScheduler,
   startDriveAutoUploadScheduler
 };

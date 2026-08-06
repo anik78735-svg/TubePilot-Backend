@@ -12,29 +12,45 @@ const YouTubeChannelSchema = new mongoose.Schema({
   connectedAt: { type: Date, default: Date.now }
 }, { _id: false });
 
-// Stores the user's OWN Google Drive connection (separate from the system-wide
-// storage Drive account used in utils/googleDrive.js for internal buffering).
-// dailyUploadTime is stored as "HH:mm" (24h, server-local time) and is checked
-// every minute by cron/scheduler.js -> startDriveAutoUploadScheduler().
-// driveProcessedFileIds tracks which Drive file IDs have already been queued
-// so the same video is never picked twice. lastAutoUploadDate ("YYYY-MM-DD")
-// prevents the scheduler from firing more than once on the same day.
 const ConnectedDriveSchema = new mongoose.Schema({
   email: String,
   displayName: String,
   accessToken: String,
   refreshToken: String,
   tokenExpiryDate: Number,
-  folderId: { type: String, default: null }, // optional: restrict to one Drive folder; null = whole Drive
-  folderName: { type: String, default: null }, // display label for the picked folder ("null" = whole Drive)
-  dailyUploadTime: { type: String, default: null }, // "HH:mm"
-  lastAutoUploadDate: { type: String, default: null }, // "YYYY-MM-DD"
+  folderId: { type: String, default: null },
+  folderName: { type: String, default: null },
+  dailyUploadTime: { type: String, default: null },
+  lastAutoUploadDate: { type: String, default: null },
   driveProcessedFileIds: [{ type: String }],
   connectedAt: { type: Date, default: Date.now }
 }, { _id: false });
 
+// Both Instagram and Facebook publishing go through a connected Facebook
+// Page's access token (Meta Graph API requirement — there is no separate
+// "Instagram-only" OAuth for content publishing). pageAccessToken is a
+// long-lived Page token (does not expire under normal use, but can be
+// invalidated by the user revoking access).
+const ConnectedFacebookSchema = new mongoose.Schema({
+  pageId: String,
+  pageName: String,
+  pageAccessToken: String,
+  connectedAt: { type: Date, default: Date.now }
+}, { _id: false });
+
+// igUserId/igUsername come from the Facebook Page's linked Instagram
+// Business/Creator account. Publishing uses the SAME pageAccessToken stored
+// on connectedFacebook above (Instagram Graph API calls are authenticated
+// with the Page token, not a separate Instagram token).
+const ConnectedInstagramSchema = new mongoose.Schema({
+  igUserId: String,
+  igUsername: String,
+  linkedPageId: String,
+  connectedAt: { type: Date, default: Date.now }
+}, { _id: false });
+
 const UserSchema = new mongoose.Schema({
-  userId: { type: String, unique: true, index: true }, // e.g. TP102458
+  userId: { type: String, unique: true, index: true },
   name: { type: String, default: '' },
   username: { type: String, unique: true, sparse: true },
   email: { type: String, unique: true, sparse: true, lowercase: true, trim: true },
@@ -46,20 +62,18 @@ const UserSchema = new mongoose.Schema({
   language: { type: String, default: 'English' },
   referralCode: { type: String, unique: true, sparse: true },
   referredBy: { type: String, default: null },
-  diamondBalance: { type: Number, default: 0 }, // no starter bonus — diamonds are only granted when a valid referral code is applied (see routes/auth.js -> /apply-referral)
+  diamondBalance: { type: Number, default: 0 },
   autoRefillDiamonds: { type: Boolean, default: false },
   freeUploadsRemaining: { type: Number, default: 20 },
   freeUploadsResetAt: { type: Date, default: () => new Date(new Date().setMonth(new Date().getMonth() + 1)) },
   storageUsedBytes: { type: Number, default: 0 },
   fcmTokens: [{ type: String }],
-  oneSignalPlayerIds: [{ type: String }], // used only for the "diamonds exhausted, please buy more" alert via OneSignal
+  oneSignalPlayerIds: [{ type: String }],
   youtubeChannel: { type: YouTubeChannelSchema, default: null },
   connectedDrive: { type: ConnectedDriveSchema, default: null },
-  // How many times this user has ever completed a Drive connect (across
-  // connect/disconnect/reconnect cycles). Persists even after disconnect —
-  // that's what lets us charge for the 2nd+ connect. 0 = never connected =
-  // next connect is free.
   driveConnectCount: { type: Number, default: 0 },
+  connectedFacebook: { type: ConnectedFacebookSchema, default: null },
+  connectedInstagram: { type: ConnectedInstagramSchema, default: null },
   subscription: {
     isActive: { type: Boolean, default: false },
     plan: { type: String, default: null },
@@ -92,6 +106,9 @@ UserSchema.methods.toSafeObject = function () {
     delete obj.connectedDrive.accessToken;
     delete obj.connectedDrive.refreshToken;
     delete obj.connectedDrive.driveProcessedFileIds;
+  }
+  if (obj.connectedFacebook) {
+    delete obj.connectedFacebook.pageAccessToken;
   }
   return obj;
 };

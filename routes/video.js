@@ -11,7 +11,9 @@ const router = express.Router();
 
 const DIAMOND_COST_PER_UPLOAD = Number(process.env.DIAMOND_COST_PER_UPLOAD || 10);
 
-// Deducts either a free upload slot or diamonds. Throws if neither is available.
+// Deducts either a free upload slot or diamonds. Charged ONCE per upload
+// regardless of how many platforms are selected — the user uploads one
+// video file, not one per platform.
 const chargeForUpload = (user) => {
   if (user.freeUploadsRemaining > 0) {
     user.freeUploadsRemaining -= 1;
@@ -31,30 +33,33 @@ const storeVideoFile = async (buffer, filename, mimetype) => {
   const picked = await pickAvailableCloudinaryAccount(buffer.length);
   if (picked) {
     const result = await uploadBufferToCloudinary(picked.account, buffer, { public_id: filename });
-    return {
-      storageProvider: picked.key,
-      storageFileId: result.public_id,
-      storageUrl: result.secure_url
-    };
+    return { storageProvider: picked.key, storageFileId: result.public_id, storageUrl: result.secure_url };
   }
-
-  // Both Cloudinary accounts full -> Google Drive
   const driveFile = await uploadBufferToDrive(buffer, filename, mimetype);
-  return {
-    storageProvider: 'google_drive',
-    storageFileId: driveFile.id,
-    storageUrl: driveFile.webViewLink
-  };
+  return { storageProvider: 'google_drive', storageFileId: driveFile.id, storageUrl: driveFile.webViewLink };
+};
+
+const parseCommaList = (str) => (str ? str.split(',').map((t) => t.trim()).filter(Boolean) : []);
+const parseJson = (str, fallback = {}) => {
+  try { return JSON.parse(str); } catch (_) { return fallback; }
 };
 
 // @route POST /api/videos/upload
-// multipart/form-data: video, thumbnail(optional), title, description, tags, category, playlist, audience, scheduledAt(optional)
-//
-// Privacy behaviour:
-// - privacyStatus 'unlisted' or 'private': uploads immediately with that privacy, and stays that way permanently.
-// - privacyStatus 'public' with no scheduledAt: uploads immediately as public.
-// - privacyStatus 'public' WITH scheduledAt: uploads immediately as 'unlisted' (so it's live but hidden),
-//   and cron/scheduler.js's privacy-publish job flips it to 'public' once scheduledAt arrives.
+// multipart/form-data:
+//   video (file, required), thumbnail (file, optional — YouTube only)
+//   platforms: JSON array e.g. '["youtube","instagram","facebook"]'
+//   youtube:   JSON e.g. '{"title":"...","description":"...","tags":"a,b",
+//                          "category":"22","playlist":"","audience":"not_for_kids",
+//                          "privacyStatus":"public","scheduledAt":"2026-08-05T18:00:00Z"}'
+//   instagram: JSON e.g. '{"caption":"...","hashtags":"a,b","location":"",
+//                          "scheduledAt":"2026-08-05T19:15:00Z"}'
+//   facebook:  JSON e.g. '{"caption":"...","hashtags":"a,b",
+//                          "scheduledAt":"2026-08-05T20:30:00Z"}'
+// scheduledAt on each platform = when to run that platform's publish. Omit
+// (or leave null) to publish as soon as it's picked up by the scheduler
+// (Mode 1 "Publish Everywhere" just sends the same scheduledAt for every
+// selected platform from the app; Mode 2 sends different times per platform
+// — the backend doesn't need to know which UI mode was used).
 router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   try {
     const user = req.user;
@@ -62,19 +67,26 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       return res.status(400).json({ success: false, message: 'Video file is required' });
     }
 
-    const { title, description, tags, category, playlist, audience, privacyStatus, scheduledAt } = req.body;
-    if (!title) return res.status(400).json({ success: false, message: 'Title is required' });
-    if (!user.youtubeChannel) {
-      return res.status(400).json({ success: false, message: 'Please connect a YouTube channel first' });
+    const platformsRequested = parseJson(req.body.platforms, []);
+    if (!Array.isArray(platformsRequested) || platformsRequested.length === 0) {
+      return res.status(400).json({ success: false, message: 'Select at least one platform' });
     }
 
-    const requestedPrivacy = ['public', 'unlisted', 'private'].includes(privacyStatus) ? privacyStatus : 'public';
-    // Only "Public + a future scheduledAt" delays going public; every other
-    // combination uploads immediately at the privacy the user picked.
-    const isDelayedPublic = requestedPrivacy === 'public' && !!scheduledAt;
-    const initialPrivacyStatus = isDelayedPublic ? 'unlisted' : requestedPrivacy;
+    // Validate every requested platform is actually connected BEFORE
+    // charging anything.
+    for (const p of platformsRequested) {
+      if (p === 'youtube' && !user.youtubeChannel) {
+        return res.status(400).json({ success: false, message: 'Connect your YouTube channel first', code: 'YOUTUBE_NOT_CONNECTED' });
+      }
+      if (p === 'instagram' && !user.connectedInstagram) {
+        return res.status(400).json({ success: false, message: 'Connect Instagram first', code: 'INSTAGRAM_NOT_CONNECTED' });
+      }
+      if (p === 'facebook' && !user.connectedFacebook) {
+        return res.status(400).json({ success: false, message: 'Connect Facebook first', code: 'FACEBOOK_NOT_CONNECTED' });
+      }
+    }
 
-    // Charge credit BEFORE the (slow) upload so we never store a video the user can't afford
+    // Charge BEFORE the (slow) upload so we never store a video the user can't afford.
     const charge = chargeForUpload(user);
 
     const videoFile = req.files.video[0];
@@ -91,22 +103,61 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       thumbnailUrl = thumbUpload ? thumbUpload.secure_url : '';
     }
 
+    const platforms = [];
+    for (const p of platformsRequested) {
+      if (p === 'youtube') {
+        const yt = parseJson(req.body.youtube, {});
+        const requestedPrivacy = ['public', 'unlisted', 'private'].includes(yt.privacyStatus) ? yt.privacyStatus : 'public';
+        const scheduledAt = yt.scheduledAt ? new Date(yt.scheduledAt) : null;
+        platforms.push({
+          platform: 'youtube',
+          status: scheduledAt && scheduledAt > new Date() ? 'pending' : 'queued',
+          scheduledAt,
+          title: yt.title || '',
+          description: yt.description || '',
+          tags: parseCommaList(yt.tags),
+          category: yt.category || '22',
+          playlist: yt.playlist || '',
+          audience: yt.audience || 'not_for_kids',
+          privacyStatus: requestedPrivacy,
+          targetPrivacyStatus: requestedPrivacy,
+          thumbnailUrl
+        });
+      } else if (p === 'instagram') {
+        const ig = parseJson(req.body.instagram, {});
+        const scheduledAt = ig.scheduledAt ? new Date(ig.scheduledAt) : null;
+        platforms.push({
+          platform: 'instagram',
+          status: scheduledAt && scheduledAt > new Date() ? 'pending' : 'queued',
+          scheduledAt,
+          caption: ig.caption || '',
+          hashtags: parseCommaList(ig.hashtags),
+          location: ig.location || ''
+        });
+      } else if (p === 'facebook') {
+        const fb = parseJson(req.body.facebook, {});
+        const scheduledAt = fb.scheduledAt ? new Date(fb.scheduledAt) : null;
+        platforms.push({
+          platform: 'facebook',
+          status: scheduledAt && scheduledAt > new Date() ? 'pending' : 'queued',
+          scheduledAt,
+          caption: fb.caption || '',
+          hashtags: parseCommaList(fb.hashtags)
+        });
+      }
+    }
+
+    if (!platforms.length) {
+      return res.status(400).json({ success: false, message: 'No valid platforms selected' });
+    }
+
     const video = await Video.create({
       user: user._id,
-      title,
-      description: description || '',
-      tags: tags ? tags.split(',').map((t) => t.trim()).filter(Boolean) : [],
-      category: category || '22',
-      playlist: playlist || '',
-      audience: audience || 'not_for_kids',
-      privacyStatus: initialPrivacyStatus,
-      targetPrivacyStatus: requestedPrivacy,
-      thumbnailUrl,
       storageProvider: stored.storageProvider,
       storageFileId: stored.storageFileId,
       storageUrl: stored.storageUrl,
       fileSizeBytes: videoFile.size,
-      scheduledAt: isDelayedPublic ? scheduledAt : null,
+      platforms,
       status: 'queued',
       diamondsCharged: charge.diamondsCharged,
       usedFreeUpload: charge.usedFreeUpload
@@ -115,18 +166,9 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
     user.storageUsedBytes += videoFile.size;
     await user.save();
 
-    // Every video is picked up immediately by the same cron worker
-    // (cron/scheduler.js) since status is always 'queued' here. If this is a
-    // delayed-public video, a separate cron job in the same file later flips
-    // its privacy from 'unlisted' to 'public' once scheduledAt arrives.
-
     res.status(201).json({ success: true, video });
   } catch (err) {
     if (err.code === 'INSUFFICIENT_DIAMONDS') {
-      // Free uploads + diamonds are both exhausted — nudge the user via
-      // OneSignal to buy more diamonds. This does NOT touch Firebase push
-      // notifications used elsewhere in the app (utils/push.js), and it
-      // never blocks or delays the error response sent back to the client.
       sendOneSignalToUser(req.user, {
         title: 'Your credits are over 💎',
         body: 'Your free uploads and diamonds are used up. Please buy diamonds to upload your video.',
@@ -138,12 +180,11 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
   }
 });
 
-// @route GET /api/videos?status=scheduled|uploaded|draft|failed
+// @route GET /api/videos?status=queued|uploaded|draft|failed|partially_uploaded
 router.get('/', protect, async (req, res) => {
   try {
     const filter = { user: req.user._id };
     if (req.query.status) filter.status = req.query.status;
-
     const videos = await Video.find(filter).sort({ createdAt: -1 }).limit(Number(req.query.limit) || 50);
     res.json({ success: true, videos });
   } catch (err) {
@@ -162,18 +203,24 @@ router.get('/:id', protect, async (req, res) => {
   }
 });
 
-// @route PATCH /api/videos/:id/schedule  { scheduledAt }
-router.patch('/:id/schedule', protect, async (req, res) => {
+// @route PATCH /api/videos/:id/schedule/:platform  { scheduledAt }
+// Reschedule ONE platform target on a video (e.g. only push Instagram's time back).
+router.patch('/:id/schedule/:platform', protect, async (req, res) => {
   try {
     const { scheduledAt } = req.body;
     if (!scheduledAt) return res.status(400).json({ success: false, message: 'scheduledAt is required' });
 
-    const video = await Video.findOneAndUpdate(
-      { _id: req.params.id, user: req.user._id },
-      { scheduledAt, status: 'scheduled' },
-      { new: true }
-    );
+    const video = await Video.findOne({ _id: req.params.id, user: req.user._id });
     if (!video) return res.status(404).json({ success: false, message: 'Video not found' });
+
+    const target = video.platforms.find((p) => p.platform === req.params.platform);
+    if (!target) return res.status(404).json({ success: false, message: 'Platform target not found on this video' });
+    if (target.status === 'uploaded') return res.status(400).json({ success: false, message: 'Already published to this platform' });
+
+    target.scheduledAt = new Date(scheduledAt);
+    target.status = target.scheduledAt > new Date() ? 'pending' : 'queued';
+    video.recomputeStatus();
+    await video.save();
 
     res.json({ success: true, video });
   } catch (err) {
@@ -181,16 +228,15 @@ router.patch('/:id/schedule', protect, async (req, res) => {
   }
 });
 
-// @route DELETE /api/videos/:id  (cancel a scheduled/queued upload)
+// @route DELETE /api/videos/:id  (cancel every not-yet-uploaded platform target)
 router.delete('/:id', protect, async (req, res) => {
   try {
     const video = await Video.findOne({ _id: req.params.id, user: req.user._id });
     if (!video) return res.status(404).json({ success: false, message: 'Video not found' });
     if (video.status === 'uploaded') {
-      return res.status(400).json({ success: false, message: 'Cannot delete an already uploaded video from here' });
+      return res.status(400).json({ success: false, message: 'Cannot delete an already fully-uploaded video from here' });
     }
 
-    // Refund the credit that was charged
     if (video.usedFreeUpload) {
       req.user.freeUploadsRemaining += 1;
     } else if (video.diamondsCharged > 0) {
@@ -203,7 +249,7 @@ router.delete('/:id', protect, async (req, res) => {
       user: req.user._id,
       type: 'upload_failed',
       title: 'Upload Cancelled',
-      message: `"${video.title}" was cancelled and your credit was refunded.`
+      message: 'Your upload was cancelled and your credit was refunded.'
     });
 
     res.json({ success: true, message: 'Video cancelled and credit refunded' });
@@ -213,8 +259,5 @@ router.delete('/:id', protect, async (req, res) => {
 });
 
 module.exports = router;
-// NEW: exported alongside the router (a router is just a function, so extra
-// properties can safely hang off it) so cron/scheduler.js can reuse the exact
-// same charge + storage logic for Drive auto-uploads, instead of duplicating it.
 module.exports.chargeForUpload = chargeForUpload;
 module.exports.storeVideoFile = storeVideoFile;

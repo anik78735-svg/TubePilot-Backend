@@ -47,19 +47,28 @@ const parseJson = (str, fallback = {}) => {
 // @route POST /api/videos/upload
 // multipart/form-data:
 //   video (file, required), thumbnail (file, optional — YouTube only)
-//   platforms: JSON array e.g. '["youtube","instagram","facebook"]'
+//   platforms: JSON array e.g. '["youtube","facebook"]'
 //   youtube:   JSON e.g. '{"title":"...","description":"...","tags":"a,b",
 //                          "category":"22","playlist":"","audience":"not_for_kids",
 //                          "privacyStatus":"public","scheduledAt":"2026-08-05T18:00:00Z"}'
-//   instagram: JSON e.g. '{"caption":"...","hashtags":"a,b","location":"",
-//                          "scheduledAt":"2026-08-05T19:15:00Z"}'
 //   facebook:  JSON e.g. '{"caption":"...","hashtags":"a,b",
 //                          "scheduledAt":"2026-08-05T20:30:00Z"}'
-// scheduledAt on each platform = when to run that platform's publish. Omit
-// (or leave null) to publish as soon as it's picked up by the scheduler
-// (Mode 1 "Publish Everywhere" just sends the same scheduledAt for every
-// selected platform from the app; Mode 2 sends different times per platform
-// — the backend doesn't need to know which UI mode was used).
+//
+// Scheduling behaviour (important — differs by platform):
+//   - YouTube: the video uploads to YouTube IMMEDIATELY, no matter what
+//     scheduledAt is. If scheduledAt is in the future, it uploads as
+//     'unlisted' and the scheduler (cron/scheduler.js) flips it to the
+//     user's chosen privacyStatus (targetPrivacyStatus) the moment
+//     scheduledAt arrives — this way the video is already fully processed
+//     on YouTube's side and "goes public" instantly at the scheduled time
+//     instead of only starting the (slow) upload then. That's why YouTube
+//     targets are created with status 'queued' here regardless of
+//     scheduledAt — never 'pending'.
+//   - Facebook: Reels have no "unlisted, reveal later" option via the
+//     Graph API, so scheduling just delays WHEN we publish. A future
+//     scheduledAt keeps the Facebook target 'pending' until the scheduler
+//     promotes it to 'queued' at that time; no scheduledAt (or a past one)
+//     means it goes straight to 'queued' and publishes right away.
 router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   try {
     const user = req.user;
@@ -77,9 +86,6 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
     for (const p of platformsRequested) {
       if (p === 'youtube' && !user.youtubeChannel) {
         return res.status(400).json({ success: false, message: 'Connect your YouTube channel first', code: 'YOUTUBE_NOT_CONNECTED' });
-      }
-      if (p === 'instagram' && !user.connectedInstagram) {
-        return res.status(400).json({ success: false, message: 'Connect Instagram first', code: 'INSTAGRAM_NOT_CONNECTED' });
       }
       if (p === 'facebook' && !user.connectedFacebook) {
         return res.status(400).json({ success: false, message: 'Connect Facebook first', code: 'FACEBOOK_NOT_CONNECTED' });
@@ -111,7 +117,12 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
         const scheduledAt = yt.scheduledAt ? new Date(yt.scheduledAt) : null;
         platforms.push({
           platform: 'youtube',
-          status: scheduledAt && scheduledAt > new Date() ? 'pending' : 'queued',
+          // Always 'queued' — YouTube uploads immediately (see note above).
+          // The scheduler decides at upload time whether to upload as
+          // unlisted (if scheduledAt is in the future) or straight to
+          // requestedPrivacy, and later promotes unlisted -> requestedPrivacy
+          // once scheduledAt is reached.
+          status: 'queued',
           scheduledAt,
           title: yt.title || '',
           description: yt.description || '',
@@ -121,18 +132,8 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
           audience: yt.audience || 'not_for_kids',
           privacyStatus: requestedPrivacy,
           targetPrivacyStatus: requestedPrivacy,
+          youtubePrivacyPromoted: false,
           thumbnailUrl
-        });
-      } else if (p === 'instagram') {
-        const ig = parseJson(req.body.instagram, {});
-        const scheduledAt = ig.scheduledAt ? new Date(ig.scheduledAt) : null;
-        platforms.push({
-          platform: 'instagram',
-          status: scheduledAt && scheduledAt > new Date() ? 'pending' : 'queued',
-          scheduledAt,
-          caption: ig.caption || '',
-          hashtags: parseCommaList(ig.hashtags),
-          location: ig.location || ''
         });
       } else if (p === 'facebook') {
         const fb = parseJson(req.body.facebook, {});
@@ -204,7 +205,13 @@ router.get('/:id', protect, async (req, res) => {
 });
 
 // @route PATCH /api/videos/:id/schedule/:platform  { scheduledAt }
-// Reschedule ONE platform target on a video (e.g. only push Instagram's time back).
+// Reschedule ONE platform target on a video (e.g. only push Facebook's time
+// back, or move up when a YouTube video goes public).
+//
+// For YouTube: if the video was already uploaded (unlisted) and is waiting
+// to be promoted, this just changes WHEN the promotion happens — no
+// re-upload. If it hasn't uploaded yet, it stays 'queued' as usual (see
+// upload route notes above).
 router.patch('/:id/schedule/:platform', protect, async (req, res) => {
   try {
     const { scheduledAt } = req.body;
@@ -215,10 +222,25 @@ router.patch('/:id/schedule/:platform', protect, async (req, res) => {
 
     const target = video.platforms.find((p) => p.platform === req.params.platform);
     if (!target) return res.status(404).json({ success: false, message: 'Platform target not found on this video' });
-    if (target.status === 'uploaded') return res.status(400).json({ success: false, message: 'Already published to this platform' });
 
-    target.scheduledAt = new Date(scheduledAt);
-    target.status = target.scheduledAt > new Date() ? 'pending' : 'queued';
+    if (target.platform === 'youtube') {
+      if (target.status === 'uploaded' && target.youtubePrivacyPromoted) {
+        return res.status(400).json({ success: false, message: 'This video is already public on YouTube' });
+      }
+      target.scheduledAt = new Date(scheduledAt);
+      // If it hasn't uploaded yet, leave it 'queued' so it uploads right
+      // away (as unlisted, since scheduledAt is presumably in the future).
+      // If it's already uploaded and unlisted, it just waits for the new
+      // scheduledAt to be promoted — status stays 'uploaded'.
+      if (target.status !== 'uploaded') {
+        target.status = 'queued';
+      }
+    } else {
+      if (target.status === 'uploaded') return res.status(400).json({ success: false, message: 'Already published to this platform' });
+      target.scheduledAt = new Date(scheduledAt);
+      target.status = target.scheduledAt > new Date() ? 'pending' : 'queued';
+    }
+
     video.recomputeStatus();
     await video.save();
 

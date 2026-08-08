@@ -10,9 +10,7 @@ const META_REDIRECT_URI = process.env.META_REDIRECT_URI;
 const META_SCOPES = [
   'pages_show_list',
   'pages_read_engagement',
-  'pages_manage_posts',
-  'instagram_basic',
-  'instagram_content_publish'
+  'pages_manage_posts'
 ].join(',');
 
 const logMetaError = (label, err) => {
@@ -80,20 +78,6 @@ const getUserPages = async (userAccessToken) => {
   }
 };
 
-const getInstagramBusinessAccount = async (pageId, pageAccessToken) => {
-  try {
-    const res = await axios.get(`${GRAPH_BASE}/${pageId}`, {
-      params: { fields: 'instagram_business_account{id,username}', access_token: pageAccessToken }
-    });
-    const ig = res.data.instagram_business_account || null;
-    console.log(`ℹ️ [Meta:getInstagramBusinessAccount] Page ${pageId} ->`, ig ? `linked to @${ig.username}` : 'NO linked Instagram account');
-    return ig;
-  } catch (err) {
-    logMetaError('getInstagramBusinessAccount', err);
-    return null;
-  }
-};
-
 // Polls a Facebook video's processing status after the "finish" upload
 // phase. The finish call returns success as soon as Facebook has ACCEPTED
 // the video_url, NOT once it has finished downloading/processing it from
@@ -153,70 +137,10 @@ const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption 
   }
 };
 
-const createInstagramContainer = async ({ igUserId, pageAccessToken, videoUrl, caption }) => {
-  try {
-    const res = await axios.post(`${GRAPH_BASE}/${igUserId}/media`, null, {
-      params: { media_type: 'REELS', video_url: videoUrl, caption: caption || '', access_token: pageAccessToken }
-    });
-    console.log(`✅ [Meta:createInstagramContainer] Container created: ${res.data.id}`);
-    return res.data.id;
-  } catch (err) {
-    logMetaError('createInstagramContainer', err);
-    throw err;
-  }
-};
-
-const getInstagramContainerStatus = async (containerId, pageAccessToken) => {
-  try {
-    const res = await axios.get(`${GRAPH_BASE}/${containerId}`, {
-      params: { fields: 'status_code', access_token: pageAccessToken }
-    });
-    return res.data.status_code;
-  } catch (err) {
-    logMetaError('getInstagramContainerStatus', err);
-    throw err;
-  }
-};
-
-const publishInstagramContainer = async (igUserId, containerId, pageAccessToken) => {
-  try {
-    const res = await axios.post(`${GRAPH_BASE}/${igUserId}/media_publish`, null, {
-      params: { creation_id: containerId, access_token: pageAccessToken }
-    });
-    console.log(`✅ [Meta:publishInstagramContainer] Published: ${res.data.id}`);
-    return res.data.id;
-  } catch (err) {
-    logMetaError('publishInstagramContainer', err);
-    throw err;
-  }
-};
-
-const publishInstagramReel = async ({ igUserId, pageAccessToken, videoUrl, caption }) => {
-  console.log(`▶️ [Meta:publishInstagramReel] Starting for igUserId ${igUserId}, video: ${videoUrl}`);
-  const containerId = await createInstagramContainer({ igUserId, pageAccessToken, videoUrl, caption });
-
-  const maxAttempts = 24;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const status = await getInstagramContainerStatus(containerId, pageAccessToken);
-    console.log(`ℹ️ [Meta:publishInstagramReel] Poll ${attempt + 1}/${maxAttempts}: status=${status}`);
-    if (status === 'FINISHED') {
-      const mediaId = await publishInstagramContainer(igUserId, containerId, pageAccessToken);
-      return { platformPostId: mediaId, platformUrl: `https://www.instagram.com/reel/${mediaId}` };
-    }
-    if (status === 'ERROR' || status === 'EXPIRED') {
-      throw new Error(`Instagram failed to process the video (status: ${status})`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-  }
-  throw new Error('Instagram video processing timed out');
-};
-
 module.exports = {
   getFacebookOAuthUrl,
   exchangeCodeForToken,
   getLongLivedUserToken,
   getUserPages,
-  getInstagramBusinessAccount,
-  publishFacebookReel,
-  publishInstagramReel
+  publishFacebookReel
 };

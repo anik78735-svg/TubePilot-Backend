@@ -78,6 +78,32 @@ const getUserPages = async (userAccessToken) => {
   }
 };
 
+// Revokes the app's access on Facebook's side for a connected Page, so a
+// future "Connect Facebook" starts from a clean consent screen instead of
+// Facebook silently reusing the old "Continue as X" cached grant. We only
+// hold a Page access token (not a user token), so we revoke at the Page
+// level: DELETE /{page-id}/permissions removes the permissions this app
+// was granted for that Page. This is best-effort — if Facebook's side
+// fails (token already expired/invalid, network issue, etc.) we still want
+// the caller to go ahead and clear our own DB record, so this never throws;
+// it just reports success/failure so the caller can log it.
+const revokeFacebookAccess = async (pageId, pageAccessToken) => {
+  if (!pageId || !pageAccessToken) {
+    console.warn('⚠️ [Meta:revokeFacebookAccess] Missing pageId or pageAccessToken, skipping revoke call');
+    return { revoked: false, reason: 'missing pageId or pageAccessToken' };
+  }
+  try {
+    const res = await axios.delete(`${GRAPH_BASE}/${pageId}/permissions`, {
+      params: { access_token: pageAccessToken }
+    });
+    console.log(`✅ [Meta:revokeFacebookAccess] Revoked permissions for page ${pageId}:`, JSON.stringify(res.data));
+    return { revoked: true };
+  } catch (err) {
+    logMetaError('revokeFacebookAccess', err);
+    return { revoked: false, reason: err.response?.data?.error?.message || err.message };
+  }
+};
+
 // Polls a Facebook video's processing status after the "finish" upload
 // phase. The finish call returns success as soon as Facebook has ACCEPTED
 // the video_url, NOT once it has finished downloading/processing it from
@@ -152,5 +178,6 @@ module.exports = {
   exchangeCodeForToken,
   getLongLivedUserToken,
   getUserPages,
+  revokeFacebookAccess,
   publishFacebookReel
 };

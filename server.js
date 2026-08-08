@@ -1,5 +1,4 @@
 require('dotenv').config();
-
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -7,7 +6,6 @@ const cookieParser = require('cookie-parser');
 const rateLimit = require('express-rate-limit');
 
 const connectDB = require('./config/db');
-
 const {
   startPublishScheduler,
   startRetryScheduler,
@@ -32,13 +30,18 @@ const seedAdminRoute = require('./routes/seedAdmin');
 
 const app = express();
 
-/* -------------------- Security -------------------- */
+// Required because Render (and most hosts) sit behind a reverse proxy — this
+// tells Express to trust the X-Forwarded-For header for the real client IP,
+// which express-rate-limit needs to correctly rate-limit per-user instead of
+// treating every request as coming from the proxy.
+app.set('trust proxy', 1);
 
+// --- Security & core middleware ---
 app.use(helmet());
 
 const allowedOrigins = (process.env.FRONTEND_URL || '')
   .split(',')
-  .map(origin => origin.trim())
+  .map((o) => o.trim())
   .filter(Boolean);
 
 app.use(cors({
@@ -46,68 +49,21 @@ app.use(cors({
     if (!origin || allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
-
-    console.warn(`⚠️ CORS blocked: ${origin}`);
+    console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
     return callback(new Error('Not allowed by CORS'));
   },
   credentials: true
 }));
-
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({
-  extended: true,
-  limit: '10mb'
-}));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
 
-/* -------------------- Rate Limit -------------------- */
+const globalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 300 });
+app.use('/api/', globalLimiter);
 
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 300
-});
-
-app.use('/api', globalLimiter);
-
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20
-});
-
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
-
-/* -------------------- Root Route -------------------- */
-
-app.get('/', (req, res) => {
-  res.status(200).json({
-    success: true,
-    application: 'TubePilot API',
-    version: '1.0.0',
-    status: 'Running',
-    environment: process.env.NODE_ENV || 'development',
-    documentation: '/api/health',
-    timestamp: new Date().toISOString()
-  });
-});
-
-/* -------------------- Health -------------------- */
-
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: 'TubePilot API is running'
-  });
-});
-
-app.get('/api/health', (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: 'TubePilot API is running'
-  });
-});
-
-/* -------------------- API Routes -------------------- */
 
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
@@ -124,46 +80,26 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/seed-admin', seedAdminRoute);
 
-/* -------------------- API 404 -------------------- */
+app.get('/api/health', (req, res) => res.json({ success: true, message: 'TubePilot API is running' }));
 
-app.use('/api', (req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'API Route Not Found'
-  });
-});
-
-/* -------------------- Global Error Handler -------------------- */
+app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
 
 app.use((err, req, res, next) => {
-  console.error(err);
-
-  res.status(err.status || 500).json({
-    success: false,
-    message: err.message || 'Internal Server Error'
-  });
+  console.error(err.stack);
+  res.status(err.status || 500).json({ success: false, message: err.message || 'Server error' });
 });
-
-/* -------------------- Server -------------------- */
 
 const PORT = process.env.PORT || 5000;
 
 const start = async () => {
-  try {
-    await connectDB();
-
-    app.listen(PORT, () => {
-      console.log(`🚀 TubePilot backend running on port ${PORT}`);
-
-      startPublishScheduler();
-      startRetryScheduler();
-      startFreeUploadReset();
-      startDriveAutoUploadScheduler();
-    });
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
+  await connectDB();
+  app.listen(PORT, () => {
+    console.log(`🚀 TubePilot backend running on port ${PORT}`);
+    startPublishScheduler();
+    startRetryScheduler();
+    startFreeUploadReset();
+    startDriveAutoUploadScheduler();
+  });
 };
 
 start();

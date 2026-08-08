@@ -5,7 +5,7 @@ const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
 const { sendOneSignalToUser } = require('../utils/oneSignalPush');
-const { refreshAccessToken, uploadVideoToYouTube, updateVideoPrivacy } = require('../utils/youtube');
+const { refreshAccessToken, uploadVideoToYouTube, updateVideoPrivacy, isInvalidGrantError } = require('../utils/youtube');
 const { getDriveFileStream, deleteDriveFile, listUserDriveVideoFiles, downloadUserDriveFileBuffer } = require('../utils/googleDrive');
 const { publishFacebookReel } = require('../utils/meta');
 const { deleteFromCloudinary, account1, account2 } = require('../utils/cloudinary');
@@ -35,11 +35,27 @@ const ensureFreshYouTubeToken = async (user) => {
   const channel = user.youtubeChannel;
   const isExpired = !channel.tokenExpiryDate || Date.now() > channel.tokenExpiryDate - 60000;
   if (!isExpired) return channel.accessToken;
-  const credentials = await refreshAccessToken(channel.refreshToken);
-  user.youtubeChannel.accessToken = credentials.access_token;
-  user.youtubeChannel.tokenExpiryDate = credentials.expiry_date;
-  await user.save();
-  return credentials.access_token;
+
+  try {
+    const credentials = await refreshAccessToken(channel.refreshToken);
+    user.youtubeChannel.accessToken = credentials.access_token;
+    user.youtubeChannel.tokenExpiryDate = credentials.expiry_date;
+    await user.save();
+    return credentials.access_token;
+  } catch (err) {
+    // invalid_grant means the refresh_token itself is permanently
+    // invalid/expired/revoked (e.g. user revoked access, password reset,
+    // or Google silently invalidated it). Retrying this same refresh_token
+    // will NEVER succeed — the user must reconnect their YouTube account
+    // via the OAuth consent flow again. We tag the error so callers can
+    // stop retrying immediately instead of wasting MAX_RETRIES attempts.
+    if (isInvalidGrantError(err)) {
+      const reauthErr = new Error('Your YouTube authorization has expired or was revoked. Please reconnect your YouTube account.');
+      reauthErr.code = 'YOUTUBE_REAUTH_REQUIRED';
+      throw reauthErr;
+    }
+    throw err;
+  }
 };
 
 // -----------------------------------------------------------------------
@@ -144,23 +160,47 @@ const processVideoTargets = async (video) => {
         console.error(`❌ [Scheduler] Video ${video._id} / ${target.platform}: raw error detail:`, JSON.stringify(err.response.data));
       }
       target.failReason = err.message;
-      target.retryCount += 1;
       target.status = 'failed';
-      console.log(`ℹ️ [Scheduler] Video ${video._id} / ${target.platform}: retryCount now ${target.retryCount}/${MAX_RETRIES}`);
 
-      await Notification.create({
-        user: user._id,
-        type: 'upload_failed',
-        title: `${PLATFORM_LABELS[target.platform]} Upload Failed ❌`,
-        message: target.retryCount >= MAX_RETRIES
-          ? `Your video could not be published to ${PLATFORM_LABELS[target.platform]} after ${MAX_RETRIES} attempts: ${err.message}`
-          : `${PLATFORM_LABELS[target.platform]} upload failed, retrying automatically: ${err.message}`
-      });
-      await sendPushToUser(user, {
-        title: `${PLATFORM_LABELS[target.platform]} upload failed ❌`,
-        body: target.retryCount >= MAX_RETRIES ? 'Retries exhausted. Tap to see why.' : 'Retrying automatically...',
-        data: { type: 'upload_failed', videoId: video._id.toString(), platform: target.platform }
-      });
+      // YouTube refresh_token permanently invalid/revoked: retrying will
+      // never succeed until the user reconnects their account, so stop
+      // burning retry attempts and send a distinct, actionable notification
+      // instead of the generic "retrying automatically" message.
+      const needsYouTubeReauth = target.platform === 'youtube' && err.code === 'YOUTUBE_REAUTH_REQUIRED';
+
+      if (needsYouTubeReauth) {
+        target.retryCount = MAX_RETRIES;
+        console.log(`ℹ️ [Scheduler] Video ${video._id} / youtube: refresh token invalid/revoked — retries stopped, reauth required`);
+
+        await Notification.create({
+          user: user._id,
+          type: 'upload_failed',
+          title: 'YouTube Reconnection Needed 🔑',
+          message: 'Your YouTube authorization expired or was revoked. Please reconnect your YouTube account to keep publishing.'
+        });
+        await sendPushToUser(user, {
+          title: 'Reconnect your YouTube account',
+          body: 'Your YouTube authorization expired. Tap to reconnect and resume publishing.',
+          data: { type: 'youtube_reauth_required', videoId: video._id.toString(), platform: target.platform }
+        });
+      } else {
+        target.retryCount += 1;
+        console.log(`ℹ️ [Scheduler] Video ${video._id} / ${target.platform}: retryCount now ${target.retryCount}/${MAX_RETRIES}`);
+
+        await Notification.create({
+          user: user._id,
+          type: 'upload_failed',
+          title: `${PLATFORM_LABELS[target.platform]} Upload Failed ❌`,
+          message: target.retryCount >= MAX_RETRIES
+            ? `Your video could not be published to ${PLATFORM_LABELS[target.platform]} after ${MAX_RETRIES} attempts: ${err.message}`
+            : `${PLATFORM_LABELS[target.platform]} upload failed, retrying automatically: ${err.message}`
+        });
+        await sendPushToUser(user, {
+          title: `${PLATFORM_LABELS[target.platform]} upload failed ❌`,
+          body: target.retryCount >= MAX_RETRIES ? 'Retries exhausted. Tap to see why.' : 'Retrying automatically...',
+          data: { type: 'upload_failed', videoId: video._id.toString(), platform: target.platform }
+        });
+      }
     }
 
     await video.save();

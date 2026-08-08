@@ -13,8 +13,6 @@ const { chargeForUpload, storeVideoFile } = require('../routes/video');
 
 const MAX_RETRIES = 3;
 
-// ---------------- Shared storage helpers ----------------
-
 const getVideoFileStream = async (video) => {
   if (video.storageProvider === 'google_drive') return getDriveFileStream(video.storageFileId);
   const response = await axios.get(video.storageUrl, { responseType: 'stream' });
@@ -43,8 +41,6 @@ const ensureFreshYouTubeToken = async (user) => {
   await user.save();
   return credentials.access_token;
 };
-
-// ---------------- Per-platform publish ----------------
 
 const publishToYouTube = async (video, target, user) => {
   const accessToken = await ensureFreshYouTubeToken(user);
@@ -88,22 +84,22 @@ const publishToFacebook = async (video, target, user) => {
 };
 
 const PUBLISHERS = { youtube: publishToYouTube, instagram: publishToInstagram, facebook: publishToFacebook };
-
 const PLATFORM_LABELS = { youtube: 'YouTube', instagram: 'Instagram Reels', facebook: 'Facebook Reels' };
 
-// Processes every 'queued' platform target on one Video document. Each
-// target is independent: one platform failing never blocks or re-triggers
-// the others (e.g. YouTube succeeds, Instagram fails -> only Instagram is
-// retried later; Facebook, if also queued, is attempted regardless of what
-// happened to the other two in this same pass).
 const processVideoTargets = async (video) => {
   const user = await User.findById(video.user);
-  if (!user) return;
+  if (!user) {
+    console.error(`❌ [Scheduler] Video ${video._id} has no matching user (${video.user}) — skipping`);
+    return;
+  }
 
   const targets = video.platforms.filter((t) => t.status === 'queued');
+  console.log(`▶️ [Scheduler] Video ${video._id}: processing ${targets.length} queued target(s) — ${targets.map((t) => t.platform).join(', ') || 'none'}`);
+
   for (const target of targets) {
     target.status = 'processing';
     await video.save();
+    console.log(`ℹ️ [Scheduler] Video ${video._id} / ${target.platform}: status -> processing`);
 
     try {
       const publisher = PUBLISHERS[target.platform];
@@ -112,6 +108,7 @@ const processVideoTargets = async (video) => {
       target.platformPostId = result.platformPostId;
       target.platformUrl = result.platformUrl;
       target.failReason = '';
+      console.log(`✅ [Scheduler] Video ${video._id} / ${target.platform}: SUCCESS -> ${result.platformUrl}`);
 
       await Notification.create({
         user: user._id,
@@ -125,10 +122,14 @@ const processVideoTargets = async (video) => {
         data: { type: 'upload_completed', videoId: video._id.toString(), platform: target.platform, platformUrl: target.platformUrl }
       });
     } catch (err) {
-      console.error(`${target.platform} publish failed for video ${video._id}:`, err.message);
+      console.error(`❌ [Scheduler] Video ${video._id} / ${target.platform}: FAILED — ${err.message}`);
+      if (err.response?.data) {
+        console.error(`❌ [Scheduler] Video ${video._id} / ${target.platform}: raw error detail:`, JSON.stringify(err.response.data));
+      }
       target.failReason = err.message;
       target.retryCount += 1;
-      target.status = target.retryCount >= MAX_RETRIES ? 'failed' : 'failed'; // stays 'failed'; retry job re-queues it if under the limit
+      target.status = 'failed';
+      console.log(`ℹ️ [Scheduler] Video ${video._id} / ${target.platform}: retryCount now ${target.retryCount}/${MAX_RETRIES}`);
 
       await Notification.create({
         user: user._id,
@@ -151,9 +152,6 @@ const processVideoTargets = async (video) => {
   video.recomputeStatus();
   await video.save();
 
-  // Once every target has reached a terminal state (uploaded, or failed with
-  // retries exhausted), the shared temp file is no longer needed by anyone —
-  // delete it immediately rather than waiting on a 24h retention window.
   const stillNeedsFile = video.platforms.some((t) =>
     t.status === 'pending' || t.status === 'queued' || t.status === 'processing' ||
     (t.status === 'failed' && t.retryCount < MAX_RETRIES)
@@ -169,43 +167,50 @@ const startPublishScheduler = () => {
     try {
       const now = new Date();
 
-      // Promote any 'pending' targets whose scheduled time has arrived into 'queued'.
-      await Video.updateMany(
+      const promoted = await Video.updateMany(
         { 'platforms.status': 'pending', 'platforms.scheduledAt': { $lte: now } },
         { $set: { 'platforms.$[elem].status': 'queued' } },
         { arrayFilters: [{ 'elem.status': 'pending', 'elem.scheduledAt': { $lte: now } }] }
       );
+      if (promoted.modifiedCount > 0) {
+        console.log(`ℹ️ [Scheduler] Promoted ${promoted.modifiedCount} video doc(s) from pending -> queued (scheduled time reached)`);
+      }
 
       const dueVideos = await Video.find({ 'platforms.status': 'queued' }).limit(10);
+      if (dueVideos.length > 0) {
+        console.log(`▶️ [Scheduler] Tick found ${dueVideos.length} video(s) with queued platform target(s)`);
+      }
       for (const video of dueVideos) {
         await processVideoTargets(video);
       }
     } catch (err) {
-      console.error('Publish scheduler tick error:', err.message);
+      console.error('❌ [Scheduler] Publish scheduler tick error:', err.message);
     }
   });
   console.log('⏰ Multi-platform publish scheduler is running (checks every minute)');
 };
 
-// Retries failed targets under the retry limit, with a short backoff so we
-// don't hammer a platform that's temporarily down. Runs every 15 minutes.
+// Retries failed targets under the retry limit. Only logs when it actually
+// promotes something — fixes the previous version which logged this line on
+// EVERY tick even when there was nothing to retry.
 const startRetryScheduler = () => {
   cron.schedule('*/15 * * * *', async () => {
     try {
-      await Video.updateMany(
+      const result = await Video.updateMany(
         { 'platforms.status': 'failed', 'platforms.retryCount': { $lt: MAX_RETRIES } },
         { $set: { 'platforms.$[elem].status': 'queued' } },
         { arrayFilters: [{ 'elem.status': 'failed', 'elem.retryCount': { $lt: MAX_RETRIES } }] }
       );
-      console.log('🔁 Retry scheduler promoted eligible failed targets back to queued');
+      if (result.modifiedCount > 0) {
+        console.log(`🔁 [Retry Scheduler] Promoted ${result.modifiedCount} video doc(s) with failed targets back to queued`);
+      }
     } catch (err) {
-      console.error('Retry scheduler tick error:', err.message);
+      console.error('❌ [Retry Scheduler] Tick error:', err.message);
     }
   });
   console.log('🔁 Retry scheduler is running (every 15 minutes)');
 };
 
-// ---------------- Free upload monthly reset (unchanged) ----------------
 const startFreeUploadReset = () => {
   cron.schedule('0 0 * * *', async () => {
     try {
@@ -230,7 +235,6 @@ const startFreeUploadReset = () => {
   console.log('📅 Monthly free-upload reset job is running');
 };
 
-// ---------------- Google Drive daily auto-upload (adapted to platforms[]) ----------------
 const runDriveAutoUploadForUser = async (user, todayStr) => {
   try {
     if (!user.youtubeChannel) {

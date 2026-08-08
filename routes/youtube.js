@@ -1,105 +1,92 @@
-const express = require('express');
-const jwt = require('jsonwebtoken');
-const { protect } = require('../middleware/auth');
-const { getOAuthClient, exchangeCodeForTokens, getChannelInfo } = require('../utils/youtube');
-const User = require('../models/User');
+const { google } = require('googleapis');
 
-const router = express.Router();
+const getOAuthClient = () => {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    process.env.GOOGLE_REDIRECT_URI
+  );
+};
 
-// FRONTEND_URL may be a comma-separated list — use the first one to redirect back after OAuth
-const PRIMARY_FRONTEND_URL = (process.env.FRONTEND_URL || '').split(',')[0].trim();
-console.log(`ℹ️  YouTube OAuth callback will redirect back to: ${PRIMARY_FRONTEND_URL || '⚠️ EMPTY — check FRONTEND_URL in .env'}`);
-
-const SCOPES = [
-  'https://www.googleapis.com/auth/youtube.upload',
-  'https://www.googleapis.com/auth/youtube.readonly',
-  'https://www.googleapis.com/auth/youtube'
-];
-
-// @route GET /api/youtube/oauth/url?platform=mobile|web
-// Returns the Google consent URL. We encode the user's id + platform in `state` (signed) so the
-// callback (which Google redirects to, no auth header available) knows who connected and where to send them back.
-router.get('/oauth/url', protect, (req, res) => {
+// Exchanges the authorization code (from frontend Google consent screen) for tokens
+const exchangeCodeForTokens = async (code) => {
   const oauth2Client = getOAuthClient();
-  const platform = req.query.platform === 'mobile' ? 'mobile' : 'web';
-  const state = jwt.sign({ id: req.user._id, platform }, process.env.JWT_SECRET, { expiresIn: '10m' });
+  const { tokens } = await oauth2Client.getToken(code);
+  return tokens; // { access_token, refresh_token, expiry_date, ... }
+};
 
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent', // ensures refresh_token is always returned
-    scope: SCOPES,
-    state
+// Refreshes access token using stored refresh token
+const refreshAccessToken = async (refreshToken) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ refresh_token: refreshToken });
+  const { credentials } = await oauth2Client.refreshAccessToken();
+  return credentials;
+};
+
+// Detects Google's "invalid_grant" error, which means the refresh_token
+// itself is permanently invalid/expired/revoked (not just the short-lived
+// access_token). This is NOT a transient failure — retrying the same
+// refresh_token will keep failing until the user reconnects their account
+// via the OAuth consent flow again. Callers should use this to distinguish
+// "retry later" errors from "user must reconnect" errors.
+const isInvalidGrantError = (err) => {
+  return err?.response?.data?.error === 'invalid_grant';
+};
+
+const getChannelInfo = async (accessToken) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+  const res = await youtube.channels.list({ part: 'snippet,statistics', mine: true });
+  return res.data.items && res.data.items[0];
+};
+
+// Uploads a readable stream to the connected YouTube channel
+const uploadVideoToYouTube = async ({ accessToken, refreshToken, fileStream, title, description, tags, categoryId, privacyStatus, publishAt, madeForKids }) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+  const status = { privacyStatus: privacyStatus || 'private', selfDeclaredMadeForKids: !!madeForKids };
+  if (publishAt) {
+    status.privacyStatus = 'private';
+    status.publishAt = new Date(publishAt).toISOString();
+  }
+  const res = await youtube.videos.insert({
+    part: 'snippet,status',
+    requestBody: {
+      snippet: { title, description, tags, categoryId: categoryId || '22' },
+      status
+    },
+    media: { body: fileStream }
   });
+  return res.data; // includes id
+};
 
-  res.json({ success: true, url });
-});
+const setThumbnail = async ({ accessToken, refreshToken, videoId, thumbnailStream }) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+  return youtube.thumbnails.set({ videoId, media: { body: thumbnailStream } });
+};
 
-// @route GET /api/youtube/oauth/callback
-// Google redirects here after user grants permission.
-router.get('/oauth/callback', async (req, res) => {
-  let platform = 'web';
-  try {
-    const { code, state } = req.query;
-    const decoded = jwt.verify(state, process.env.JWT_SECRET);
-    platform = decoded.platform || 'web';
-    const user = await User.findById(decoded.id);
-    if (!user) throw new Error('User not found');
-
-    const tokens = await exchangeCodeForTokens(code);
-    const channel = await getChannelInfo(tokens.access_token);
-
-    if (!channel) {
-      throw new Error('No YouTube channel found on this Google account');
+// Switches an already-uploaded video's privacy status (e.g. unlisted -> public)
+// without re-uploading the file. Used by cron/scheduler.js to publish a video
+// that was uploaded unlisted and scheduled to go public later.
+const updateVideoPrivacy = async ({ accessToken, refreshToken, videoId, privacyStatus }) => {
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+  const res = await youtube.videos.update({
+    part: 'status',
+    requestBody: {
+      id: videoId,
+      status: { privacyStatus }
     }
+  });
+  return res.data;
+};
 
-    user.youtubeChannel = {
-      channelId: channel.id,
-      channelTitle: channel.snippet.title,
-      thumbnail: channel.snippet.thumbnails?.default?.url || '',
-      subscriberCount: channel.statistics?.subscriberCount || '0',
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token || user.youtubeChannel?.refreshToken,
-      tokenExpiryDate: tokens.expiry_date,
-      connectedAt: new Date()
-    };
-    await user.save();
-
-    // Mobile (Flutter app, opened via external browser) -> bounce back into the app via a custom deep link
-    // Web (Live Server / deployed site) -> redirect to the existing dashboard.html page
-    if (platform === 'mobile') {
-      res.redirect('tubepilot://oauth-success?youtube_connected=1');
-    } else {
-      res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?youtube_connected=1`);
-    }
-  } catch (err) {
-    // Logged with full detail so Render logs show the real cause
-    // (redirect_uri_mismatch, invalid_grant, missing test-user access, etc.)
-    // instead of just a generic "failed to connect" toast in the app.
-    console.error('❌ YouTube OAuth callback failed:', err.message);
-    console.error(err.stack);
-
-    if (platform === 'mobile') {
-      res.redirect(`tubepilot://oauth-success?youtube_connected=0&error=${encodeURIComponent(err.message)}`);
-    } else {
-      res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?youtube_connected=0&error=${encodeURIComponent(err.message)}`);
-    }
-  }
-});
-
-// @route DELETE /api/youtube/disconnect
-router.delete('/disconnect', protect, async (req, res) => {
-  req.user.youtubeChannel = null;
-  await req.user.save();
-  res.json({ success: true, message: 'YouTube channel disconnected' });
-});
-
-// @route GET /api/youtube/channel
-router.get('/channel', protect, async (req, res) => {
-  if (!req.user.youtubeChannel) {
-    return res.status(404).json({ success: false, message: 'No YouTube channel connected' });
-  }
-  const { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } = req.user.youtubeChannel;
-  res.json({ success: true, channel: { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } });
-});
-
-module.exports = router;
+module.exports = {
+  getOAuthClient, exchangeCodeForTokens, refreshAccessToken, isInvalidGrantError,
+  getChannelInfo, uploadVideoToYouTube, setThumbnail, updateVideoPrivacy
+};

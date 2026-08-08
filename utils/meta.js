@@ -114,23 +114,33 @@ const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption 
 
     // Wait for Facebook to actually finish fetching + processing the video
     // from our URL before reporting success — this is what protects the
-    // temp file from being deleted too early.
-    const maxAttempts = 36; // 36 * 5s = 3 minutes
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // temp file from being deleted too early. Real-world processing for
+    // longer/larger Reels regularly runs past 3 minutes while Facebook
+    // keeps reporting video_status=uploading, so we poll for up to ~8
+    // minutes total, checking less frequently once the wait gets long
+    // (fewer Graph API calls without slowing down the common fast case).
+    const maxWaitMs = 8 * 60 * 1000; // 8 minutes
+    const startedAt = Date.now();
+    let attempt = 0;
+    while (Date.now() - startedAt < maxWaitMs) {
+      attempt += 1;
       const status = await getFacebookVideoStatus(videoId, pageAccessToken);
       const videoStatus = status?.video_status;
-      console.log(`ℹ️ [Meta:publishFacebookReel] Poll ${attempt + 1}/${maxAttempts}: video_status=${videoStatus}`);
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      console.log(`ℹ️ [Meta:publishFacebookReel] Poll ${attempt} (${elapsedSec}s elapsed): video_status=${videoStatus}`);
 
       if (videoStatus === 'ready') {
-        console.log(`✅ [Meta:publishFacebookReel] Video fully processed and ready`);
+        console.log(`✅ [Meta:publishFacebookReel] Video fully processed and ready after ${elapsedSec}s`);
         return { platformPostId: videoId, platformUrl: `https://www.facebook.com/reel/${videoId}` };
       }
       if (videoStatus === 'error') {
         throw new Error(`Facebook failed to process the video: ${JSON.stringify(status)}`);
       }
-      await new Promise((resolve) => setTimeout(resolve, 5000));
+      // Poll every 5s for the first 3 minutes, then back off to every 15s.
+      const interval = elapsedSec < 180 ? 5000 : 15000;
+      await new Promise((resolve) => setTimeout(resolve, interval));
     }
-    throw new Error('Facebook video processing timed out (still not ready after 3 minutes)');
+    throw new Error('Facebook video processing timed out (still not ready after 8 minutes)');
   } catch (err) {
     logMetaError('publishFacebookReel', err);
     throw err;

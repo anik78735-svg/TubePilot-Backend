@@ -15,11 +15,6 @@ const META_SCOPES = [
   'instagram_content_publish'
 ].join(',');
 
-// Extracts the real, human-readable reason from a Meta Graph API error.
-// axios error.message is almost useless for Graph API (usually just
-// "Request failed with status code 400") — the actual reason (invalid
-// permission, expired token, unsupported request, etc.) is in
-// error.response.data.error. This logs BOTH so nothing is ever silently lost.
 const logMetaError = (label, err) => {
   const graphError = err.response?.data?.error;
   if (graphError) {
@@ -95,10 +90,22 @@ const getInstagramBusinessAccount = async (pageId, pageAccessToken) => {
     return ig;
   } catch (err) {
     logMetaError('getInstagramBusinessAccount', err);
-    // Don't throw — a page with no linked Instagram (or a permissions hiccup
-    // here) should never block Facebook from connecting successfully.
     return null;
   }
+};
+
+// Polls a Facebook video's processing status after the "finish" upload
+// phase. The finish call returns success as soon as Facebook has ACCEPTED
+// the video_url, NOT once it has finished downloading/processing it from
+// that URL — Facebook fetches the video in the background. If we delete our
+// temporary storage copy before that fetch completes, the Reel ends up
+// broken ("This page isn't available"). This poll makes sure Facebook has
+// actually finished downloading and processing before we report success.
+const getFacebookVideoStatus = async (videoId, pageAccessToken) => {
+  const res = await axios.get(`${GRAPH_BASE}/${videoId}`, {
+    params: { fields: 'status', access_token: pageAccessToken }
+  });
+  return res.data.status; // { video_status: 'ready'|'processing'|'error', ... }
 };
 
 const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption }) => {
@@ -119,9 +126,27 @@ const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption 
         access_token: pageAccessToken
       }
     });
-    console.log(`✅ [Meta:publishFacebookReel] Finish response:`, JSON.stringify(finishRes.data));
+    console.log(`ℹ️ [Meta:publishFacebookReel] Finish accepted:`, JSON.stringify(finishRes.data));
 
-    return { platformPostId: videoId, platformUrl: `https://www.facebook.com/reel/${videoId}` };
+    // Wait for Facebook to actually finish fetching + processing the video
+    // from our URL before reporting success — this is what protects the
+    // temp file from being deleted too early.
+    const maxAttempts = 36; // 36 * 5s = 3 minutes
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const status = await getFacebookVideoStatus(videoId, pageAccessToken);
+      const videoStatus = status?.video_status;
+      console.log(`ℹ️ [Meta:publishFacebookReel] Poll ${attempt + 1}/${maxAttempts}: video_status=${videoStatus}`);
+
+      if (videoStatus === 'ready') {
+        console.log(`✅ [Meta:publishFacebookReel] Video fully processed and ready`);
+        return { platformPostId: videoId, platformUrl: `https://www.facebook.com/reel/${videoId}` };
+      }
+      if (videoStatus === 'error') {
+        throw new Error(`Facebook failed to process the video: ${JSON.stringify(status)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+    throw new Error('Facebook video processing timed out (still not ready after 3 minutes)');
   } catch (err) {
     logMetaError('publishFacebookReel', err);
     throw err;

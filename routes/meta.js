@@ -15,7 +15,7 @@ const PRIMARY_FRONTEND_URL = (process.env.FRONTEND_URL || '').split(',')[0].trim
 
 // Quick sanity check of required env vars — logs once at startup
 (function checkMetaEnv() {
-  const required = ['JWT_SECRET', 'FRONTEND_URL', 'FB_APP_ID', 'FB_APP_SECRET', 'FB_REDIRECT_URI'];
+  const required = ['JWT_SECRET', 'FRONTEND_URL', 'META_APP_ID', 'META_APP_SECRET', 'META_REDIRECT_URI'];
   const missing = required.filter((k) => !process.env[k]);
   if (missing.length) {
     console.warn(`⚠️ [Meta Routes] Missing env vars: ${missing.join(', ')} — OAuth flow WILL fail without these.`);

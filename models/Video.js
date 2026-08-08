@@ -2,10 +2,10 @@ const mongoose = require('mongoose');
 
 // Per-platform publish record. Each video can target multiple platforms
 // independently — each with its own metadata, schedule time, and status, so
-// (for example) YouTube can succeed while Instagram fails and only
-// Instagram gets retried.
+// (for example) YouTube can succeed while Facebook fails and only
+// Facebook gets retried.
 const PlatformTargetSchema = new mongoose.Schema({
-  platform: { type: String, enum: ['youtube', 'instagram', 'facebook'], required: true },
+  platform: { type: String, enum: ['youtube', 'facebook'], required: true },
   status: {
     type: String,
     enum: ['pending', 'queued', 'processing', 'uploaded', 'failed'],
@@ -22,12 +22,20 @@ const PlatformTargetSchema = new mongoose.Schema({
   audience: { type: String, enum: ['made_for_kids', 'not_for_kids'], default: 'not_for_kids' },
   privacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: 'public' },
   targetPrivacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: null },
+  // YouTube only. When a target has a future scheduledAt, the scheduler
+  // uploads it immediately as 'unlisted' so it's fully processed and ready,
+  // then flips it to targetPrivacyStatus once scheduledAt arrives (see
+  // cron/scheduler.js -> promoteScheduledYouTubeVideos). This flag tracks
+  // whether that final promotion has happened yet — false right after the
+  // initial (possibly unlisted) upload, true once it's at its real target
+  // privacy. For targets with no future schedule, this is set to true at
+  // upload time since there's nothing left to promote.
+  youtubePrivacyPromoted: { type: Boolean, default: false },
   thumbnailUrl: { type: String, default: '' },
 
-  // Instagram / Facebook shared metadata
+  // Facebook metadata
   caption: { type: String, default: '' },
   hashtags: [{ type: String }],
-  location: { type: String, default: '' }, // Instagram only
 
   // Result fields, populated once processed
   platformPostId: { type: String, default: '' },
@@ -80,6 +88,12 @@ const VideoSchema = new mongoose.Schema({
 
 // Recomputes the parent `status` field from the current state of
 // `platforms[]`. Call this after mutating any platform target's status.
+//
+// NOTE: a YouTube target that's 'uploaded' but still waiting on
+// youtubePrivacyPromoted (i.e. uploaded unlisted, waiting for its
+// scheduled public time) still counts as 'uploaded' here — the promotion
+// step is a background metadata patch, not part of the publish pipeline
+// that this status tracks.
 VideoSchema.methods.recomputeStatus = function () {
   const statuses = this.platforms.map((p) => p.status);
   if (statuses.length === 0) { this.status = 'draft'; return; }

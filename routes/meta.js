@@ -5,7 +5,8 @@ const {
   getFacebookOAuthUrl,
   exchangeCodeForToken,
   getLongLivedUserToken,
-  getUserPages
+  getUserPages,
+  revokeFacebookAccess
 } = require('../utils/meta');
 const User = require('../models/User');
 
@@ -191,8 +192,27 @@ router.patch('/select-page', protect, async (req, res) => {
 router.delete('/facebook/disconnect', protect, async (req, res) => {
   try {
     console.log(`ℹ️ [Meta Disconnect] user=${req.user._id}`);
+
+    const existing = req.user.connectedFacebook;
+
+    // Best-effort: also revoke the app's access on Facebook's side so a
+    // future "Connect Facebook" starts from a clean consent screen instead
+    // of Facebook silently reusing the old cached "Continue as X" grant.
+    // This never blocks the disconnect — even if Facebook's revoke call
+    // fails (expired token, network issue, etc.), we still clear our own
+    // record below so the user's app-side state is always consistent.
+    if (existing?.pageId && existing?.pageAccessToken) {
+      const result = await revokeFacebookAccess(existing.pageId, existing.pageAccessToken);
+      if (!result.revoked) {
+        console.warn(`⚠️ [Meta Disconnect] Facebook-side revoke did not succeed (${result.reason}), proceeding with local disconnect anyway`);
+      }
+    }
+
     req.user.connectedFacebook = null;
+    req.user.set('metaPendingPages', undefined);
     await req.user.save();
+
+    console.log(`✅ [Meta Disconnect] Cleared local record for user ${req.user._id}`);
     res.json({ success: true, message: 'Facebook disconnected' });
   } catch (err) {
     console.error(`❌ [Meta Disconnect] Failed:`, err.message);

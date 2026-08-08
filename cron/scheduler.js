@@ -5,9 +5,9 @@ const User = require('../models/User');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
 const { sendOneSignalToUser } = require('../utils/oneSignalPush');
-const { refreshAccessToken, uploadVideoToYouTube } = require('../utils/youtube');
+const { refreshAccessToken, uploadVideoToYouTube, updateVideoPrivacy } = require('../utils/youtube');
 const { getDriveFileStream, deleteDriveFile, listUserDriveVideoFiles, downloadUserDriveFileBuffer } = require('../utils/googleDrive');
-const { publishFacebookReel, publishInstagramReel } = require('../utils/meta');
+const { publishFacebookReel } = require('../utils/meta');
 const { deleteFromCloudinary, account1, account2 } = require('../utils/cloudinary');
 const { chargeForUpload, storeVideoFile } = require('../routes/video');
 
@@ -42,9 +42,23 @@ const ensureFreshYouTubeToken = async (user) => {
   return credentials.access_token;
 };
 
+// -----------------------------------------------------------------------
+// YouTube upload flow:
+//   - If the user picked a future scheduledAt for YouTube, we upload the
+//     video RIGHT AWAY as 'unlisted' (so it's fully processed and ready on
+//     YouTube's side), then a separate tick (promoteScheduledYouTubeVideos
+//     below) flips it to the user's real target privacy (targetPrivacyStatus)
+//     the moment scheduledAt arrives — no re-upload needed, just a fast
+//     metadata patch.
+//   - If there's no scheduledAt, we upload directly with the target privacy.
+// -----------------------------------------------------------------------
 const publishToYouTube = async (video, target, user) => {
   const accessToken = await ensureFreshYouTubeToken(user);
   const fileStream = await getVideoFileStream(video);
+
+  const hasFutureSchedule = target.scheduledAt && new Date(target.scheduledAt) > new Date();
+  const uploadPrivacy = hasFutureSchedule ? 'unlisted' : (target.privacyStatus || 'public');
+
   const result = await uploadVideoToYouTube({
     accessToken,
     refreshToken: user.youtubeChannel.refreshToken,
@@ -53,25 +67,24 @@ const publishToYouTube = async (video, target, user) => {
     description: target.description,
     tags: target.tags,
     categoryId: target.category,
-    privacyStatus: target.privacyStatus || 'public',
+    privacyStatus: uploadPrivacy,
     madeForKids: target.audience === 'made_for_kids'
   });
+
+  // Remember what privacy this target should end up at once scheduledAt
+  // arrives (falls back to whatever was already set on the target).
+  target.targetPrivacyStatus = target.targetPrivacyStatus || target.privacyStatus || 'public';
+  target.privacyStatus = uploadPrivacy;
+  target.youtubePrivacyPromoted = !hasFutureSchedule; // true once it's at its final privacy
+
   return { platformPostId: result.id, platformUrl: `https://youtube.com/watch?v=${result.id}` };
 };
 
-const publishToInstagram = async (video, target, user) => {
-  if (!user.connectedInstagram || !user.connectedFacebook) {
-    throw new Error('Instagram is not connected');
-  }
-  const caption = [target.caption, ...(target.hashtags || []).map((h) => `#${h.replace(/^#/, '')}`)].filter(Boolean).join('\n\n');
-  return publishInstagramReel({
-    igUserId: user.connectedInstagram.igUserId,
-    pageAccessToken: user.connectedFacebook.pageAccessToken,
-    videoUrl: video.storageUrl,
-    caption
-  });
-};
-
+// NOTE: Facebook Reels don't have an "unlisted, promote later" concept via
+// the Graph API — a published Reel is live immediately. So for Facebook,
+// "scheduling" just controls WHEN we call publishFacebookReel (handled by
+// the normal pending -> queued promotion below), not a two-step
+// upload-then-promote flow like YouTube.
 const publishToFacebook = async (video, target, user) => {
   if (!user.connectedFacebook) throw new Error('Facebook is not connected');
   const caption = [target.caption, ...(target.hashtags || []).map((h) => `#${h.replace(/^#/, '')}`)].filter(Boolean).join('\n\n');
@@ -83,8 +96,8 @@ const publishToFacebook = async (video, target, user) => {
   });
 };
 
-const PUBLISHERS = { youtube: publishToYouTube, instagram: publishToInstagram, facebook: publishToFacebook };
-const PLATFORM_LABELS = { youtube: 'YouTube', instagram: 'Instagram Reels', facebook: 'Facebook Reels' };
+const PUBLISHERS = { youtube: publishToYouTube, facebook: publishToFacebook };
+const PLATFORM_LABELS = { youtube: 'YouTube', facebook: 'Facebook Reels' };
 
 const processVideoTargets = async (video) => {
   const user = await User.findById(video.user);
@@ -114,11 +127,15 @@ const processVideoTargets = async (video) => {
         user: user._id,
         type: 'upload_completed',
         title: `${PLATFORM_LABELS[target.platform]} Upload Completed ✅`,
-        message: `Your video is now live on ${PLATFORM_LABELS[target.platform]}.`
+        message: target.platform === 'youtube' && !target.youtubePrivacyPromoted
+          ? `Your video is uploaded to ${PLATFORM_LABELS[target.platform]} as unlisted and will go public at your scheduled time.`
+          : `Your video is now live on ${PLATFORM_LABELS[target.platform]}.`
       });
       await sendPushToUser(user, {
         title: `Live on ${PLATFORM_LABELS[target.platform]}! 🎉`,
-        body: 'Your video just went live.',
+        body: target.platform === 'youtube' && !target.youtubePrivacyPromoted
+          ? 'Uploaded (unlisted) — will go public at your scheduled time.'
+          : 'Your video just went live.',
         data: { type: 'upload_completed', videoId: video._id.toString(), platform: target.platform, platformUrl: target.platformUrl }
       });
     } catch (err) {
@@ -152,6 +169,11 @@ const processVideoTargets = async (video) => {
   video.recomputeStatus();
   await video.save();
 
+  // Only delete the stored source file once every target is fully done
+  // (uploaded) or has exhausted retries. IMPORTANT: a YouTube target that's
+  // uploaded-but-still-unlisted (waiting to be promoted to public) still
+  // counts as "uploaded" here — promotion only needs a metadata patch, not
+  // the original file, so it's safe to delete at that point.
   const stillNeedsFile = video.platforms.some((t) =>
     t.status === 'pending' || t.status === 'queued' || t.status === 'processing' ||
     (t.status === 'failed' && t.retryCount < MAX_RETRIES)
@@ -162,20 +184,82 @@ const processVideoTargets = async (video) => {
   }
 };
 
+// -----------------------------------------------------------------------
+// Promotes YouTube targets that were uploaded early as 'unlisted' to their
+// real target privacy (usually 'public') the moment scheduledAt arrives.
+// This does NOT re-upload the video — it's a fast videos.update() patch.
+// -----------------------------------------------------------------------
+const promoteScheduledYouTubeVideos = async () => {
+  const now = new Date();
+  const dueVideos = await Video.find({
+    'platforms.platform': 'youtube',
+    'platforms.status': 'uploaded',
+    'platforms.youtubePrivacyPromoted': false,
+    'platforms.scheduledAt': { $lte: now }
+  }).limit(20);
+
+  for (const video of dueVideos) {
+    const target = video.platforms.find(
+      (t) => t.platform === 'youtube' && t.status === 'uploaded' && !t.youtubePrivacyPromoted && t.scheduledAt && t.scheduledAt <= now
+    );
+    if (!target) continue;
+
+    try {
+      const user = await User.findById(video.user);
+      if (!user || !user.youtubeChannel) continue;
+
+      const accessToken = await ensureFreshYouTubeToken(user);
+      await updateVideoPrivacy({
+        accessToken,
+        refreshToken: user.youtubeChannel.refreshToken,
+        videoId: target.platformPostId,
+        privacyStatus: target.targetPrivacyStatus || 'public'
+      });
+
+      target.privacyStatus = target.targetPrivacyStatus || 'public';
+      target.youtubePrivacyPromoted = true;
+      await video.save();
+
+      console.log(`✅ [Scheduler] Video ${video._id} / youtube: promoted to ${target.privacyStatus} at scheduled time`);
+
+      await Notification.create({
+        user: user._id,
+        type: 'upload_completed',
+        title: 'YouTube Video Now Public 🎉',
+        message: 'Your scheduled video just went public on YouTube.'
+      });
+      await sendPushToUser(user, {
+        title: 'Your video is public on YouTube! 🎉',
+        body: 'It just switched from unlisted to public as scheduled.',
+        data: { type: 'youtube_promoted', videoId: video._id.toString(), platformUrl: target.platformUrl }
+      });
+    } catch (err) {
+      console.error(`❌ [Scheduler] Video ${video._id} / youtube: privacy promotion failed — ${err.message}`);
+    }
+  }
+};
+
 const startPublishScheduler = () => {
   cron.schedule('* * * * *', async () => {
     try {
       const now = new Date();
 
+      // Facebook (and any other non-YouTube platform) has no "upload early,
+      // reveal later" option, so its targets stay 'pending' until
+      // scheduledAt, then get promoted to 'queued' here like before.
       const promoted = await Video.updateMany(
-        { 'platforms.status': 'pending', 'platforms.scheduledAt': { $lte: now } },
+        { 'platforms.status': 'pending', 'platforms.scheduledAt': { $lte: now }, 'platforms.platform': { $ne: 'youtube' } },
         { $set: { 'platforms.$[elem].status': 'queued' } },
-        { arrayFilters: [{ 'elem.status': 'pending', 'elem.scheduledAt': { $lte: now } }] }
+        { arrayFilters: [{ 'elem.status': 'pending', 'elem.scheduledAt': { $lte: now }, 'elem.platform': { $ne: 'youtube' } }] }
       );
       if (promoted.modifiedCount > 0) {
         console.log(`ℹ️ [Scheduler] Promoted ${promoted.modifiedCount} video doc(s) from pending -> queued (scheduled time reached)`);
       }
 
+      // YouTube targets upload immediately regardless of scheduledAt (as
+      // unlisted if scheduled for later), so they go straight to 'queued'
+      // as soon as they're created — see routes/video.js. This tick just
+      // picks up anything sitting queued (any platform) and processes it.
       const dueVideos = await Video.find({ 'platforms.status': 'queued' }).limit(10);
       if (dueVideos.length > 0) {
         console.log(`▶️ [Scheduler] Tick found ${dueVideos.length} video(s) with queued platform target(s)`);
@@ -183,6 +267,10 @@ const startPublishScheduler = () => {
       for (const video of dueVideos) {
         await processVideoTargets(video);
       }
+
+      // Flip already-uploaded YouTube videos from unlisted -> their real
+      // target privacy once their scheduled time has arrived.
+      await promoteScheduledYouTubeVideos();
     } catch (err) {
       console.error('❌ [Scheduler] Publish scheduler tick error:', err.message);
     }
@@ -288,7 +376,8 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
         status: 'queued',
         title: nextFile.name || 'Untitled',
         privacyStatus: 'public',
-        targetPrivacyStatus: 'public'
+        targetPrivacyStatus: 'public',
+        youtubePrivacyPromoted: false
       }]
     });
 

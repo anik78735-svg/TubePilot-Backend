@@ -5,8 +5,7 @@ const {
   getFacebookOAuthUrl,
   exchangeCodeForToken,
   getLongLivedUserToken,
-  getUserPages,
-  getInstagramBusinessAccount
+  getUserPages
 } = require('../utils/meta');
 const User = require('../models/User');
 
@@ -48,7 +47,7 @@ router.get('/oauth/callback', async (req, res) => {
       await user.save();
     }
 
-    console.log(`✅ [Meta OAuth Callback] Done. connectedFacebook=${!!user.connectedFacebook} connectedInstagram=${!!user.connectedInstagram}`);
+    console.log(`✅ [Meta OAuth Callback] Done. connectedFacebook=${!!user.connectedFacebook}`);
 
     if (platform === 'mobile') {
       res.redirect(`tubepilot://oauth-success?meta_connected=1&multiple_pages=${pages.length > 1 ? '1' : '0'}`);
@@ -73,18 +72,6 @@ const connectPageToUser = async (user, page) => {
     connectedAt: new Date()
   };
 
-  const igAccount = await getInstagramBusinessAccount(page.id, page.access_token);
-  if (igAccount) {
-    user.connectedInstagram = {
-      igUserId: igAccount.id,
-      igUsername: igAccount.username,
-      linkedPageId: page.id,
-      connectedAt: new Date()
-    };
-  } else {
-    user.connectedInstagram = null;
-  }
-
   user.set('metaPendingPages', undefined);
   await user.save();
 };
@@ -103,38 +90,8 @@ router.patch('/select-page', protect, async (req, res) => {
     await connectPageToUser(req.user, chosen);
     res.json({
       success: true,
-      facebook: { pageId: req.user.connectedFacebook.pageId, pageName: req.user.connectedFacebook.pageName },
-      instagram: req.user.connectedInstagram
-        ? { igUserId: req.user.connectedInstagram.igUserId, igUsername: req.user.connectedInstagram.igUsername }
-        : null
+      facebook: { pageId: req.user.connectedFacebook.pageId, pageName: req.user.connectedFacebook.pageName }
     });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// @route POST /api/meta/refresh-instagram
-// Re-checks the connected Facebook Page for a linked Instagram Business
-// account, WITHOUT requiring the user to disconnect/reconnect Facebook.
-// This is exactly what's needed after accepting an Instagram Tester invite
-// post-connect.
-router.post('/refresh-instagram', protect, async (req, res) => {
-  try {
-    if (!req.user.connectedFacebook) {
-      return res.status(400).json({ success: false, message: 'Connect Facebook first' });
-    }
-    const igAccount = await getInstagramBusinessAccount(req.user.connectedFacebook.pageId, req.user.connectedFacebook.pageAccessToken);
-    if (igAccount) {
-      req.user.connectedInstagram = {
-        igUserId: igAccount.id,
-        igUsername: igAccount.username,
-        linkedPageId: req.user.connectedFacebook.pageId,
-        connectedAt: new Date()
-      };
-      await req.user.save();
-      return res.json({ success: true, instagram: { igUserId: igAccount.id, igUsername: igAccount.username } });
-    }
-    res.json({ success: true, instagram: null, message: 'No linked Instagram account found yet' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -142,9 +99,8 @@ router.post('/refresh-instagram', protect, async (req, res) => {
 
 router.delete('/facebook/disconnect', protect, async (req, res) => {
   req.user.connectedFacebook = null;
-  req.user.connectedInstagram = null;
   await req.user.save();
-  res.json({ success: true, message: 'Facebook (and linked Instagram) disconnected' });
+  res.json({ success: true, message: 'Facebook disconnected' });
 });
 
 router.get('/status', protect, async (req, res) => {
@@ -152,9 +108,6 @@ router.get('/status', protect, async (req, res) => {
     success: true,
     facebook: req.user.connectedFacebook
       ? { pageId: req.user.connectedFacebook.pageId, pageName: req.user.connectedFacebook.pageName, connectedAt: req.user.connectedFacebook.connectedAt }
-      : null,
-    instagram: req.user.connectedInstagram
-      ? { igUserId: req.user.connectedInstagram.igUserId, igUsername: req.user.connectedInstagram.igUsername, connectedAt: req.user.connectedInstagram.connectedAt }
       : null
   });
 });

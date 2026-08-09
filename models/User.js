@@ -113,4 +113,13 @@ UserSchema.methods.toSafeObject = function () {
   return obj;
 };
 
+// NOTE (Delete Account feature): actual cascade delete (Video, Transaction,
+// Notification docs) lives in routes/admin.js so it can run inside a single
+// place alongside the User.findByIdAndDelete call, and so this model file
+// doesn't need to require other models (avoids circular-require risk).
+// This model itself needs no schema changes for the feature — deleting the
+// User document is enough to make a future re-login generate a brand new
+// userId/referralCode/diamondBalance/freeUploadsRemaining, since those are
+// all schema defaults, not something looked up from old data.
+
 module.exports = mongoose.model('User', UserSchema);

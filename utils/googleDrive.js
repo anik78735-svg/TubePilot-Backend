@@ -95,7 +95,7 @@ const downloadUserDriveFileBuffer = async (user, fileId) => {
   return Buffer.from(res.data);
 };
 
-// NEW: Lists sub-folders under `parentId` (or the Drive root if parentId is
+// Lists sub-folders under `parentId` (or the Drive root if parentId is
 // omitted) so the app can show a folder picker. Used by the "select/change
 // folder" feature — the picked folder's id is then saved as
 // connectedDrive.folderId and listUserDriveVideoFiles() above scopes to it.
@@ -111,6 +111,16 @@ const listUserDriveFolders = async (user, parentId) => {
   });
   return res.data.files || [];
 };
+
+// NOTE on "delete account" storage cleanup: there is deliberately NO
+// deleteUserDriveFiles()-style function here. The Drive files a user
+// connected live in THEIR OWN Google Drive, not ours — we only ever had
+// read-only access (see DRIVE_SCOPES = ['...drive.readonly'] in
+// routes/drive.js). We have no permission to delete files from a user's
+// personal Drive, and shouldn't try to even if the scope allowed it: that
+// storage isn't ours to touch. Account deletion should only DISCONNECT
+// (clear user.connectedDrive, same as the existing DELETE /api/drive/disconnect
+// route already does) — never attempt to delete the user's own Drive files.
 
 module.exports = {
   uploadBufferToDrive,

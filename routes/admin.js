@@ -7,7 +7,8 @@ const Transaction = require('../models/Transaction');
 const PaymentSettings = require('../models/PaymentSettings');
 const Notification = require('../models/Notification');
 const { sendPushToUser } = require('../utils/push');
-const { uploadBufferToCloudinary, deleteManyFromCloudinary, account1 } = require('../utils/cloudinary');
+const { uploadBufferToCloudinary, account1 } = require('../utils/cloudinary');
+const { deleteUserAccountCascade } = require('../utils/user');
 
 const router = express.Router();
 router.use(protect, adminOnly);
@@ -203,29 +204,11 @@ router.patch('/users/:id/toggle-active', async (req, res) => {
 });
 
 // @route DELETE /api/admin/users/:id
-// PERMANENTLY deletes a user account and everything tied to it:
-//   1. Every video file the user ever uploaded, deleted from BOTH Cloudinary
-//      accounts (whichever account each file actually lives on).
-//   2. Their Google Drive connection is disconnected (connectedDrive
-//      cleared). We do NOT delete files from their own Drive — we only ever
-//      had drive.readonly access, so we have no permission to touch their
-//      Drive storage, and shouldn't even if we could. It's their Drive, not
-//      ours.
-//   3. The Video, Transaction, and Notification documents themselves.
-//   4. The User document.
-// This is irreversible — there is no soft-delete / recovery here. If they
-// sign up again with the same email/phone/Google account, they get a
-// completely fresh account: new userId, new referralCode, diamondBalance
-// back to 0, freeUploadsRemaining back to the default — because none of
-// that old data exists anymore.
-//
-// IMPORTANT: Cloudinary deletion assumes each Video doc stores the fields
-// used below (cloudinaryPublicId, cloudinaryAccount — 'cloudinary_1' or
-// 'cloudinary_2'). If your Video schema uses different field names, update
-// the `.map()` below to match — otherwise this will silently delete 0
-// Cloudinary files while still deleting the Video docs, leaving orphaned
-// files in Cloudinary with no DB record pointing to them (worse than
-// before, since you lose the reference needed to clean them up later).
+// PERMANENTLY deletes a user account and everything tied to it. Actual
+// cascade-delete logic lives in utils/user.js (deleteUserAccountCascade) —
+// shared with the self-service DELETE /api/auth/delete-account route in
+// routes/auth.js so there is exactly one place that knows how to fully wipe
+// a user, not two copies that can drift apart.
 router.delete('/users/:id', async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
@@ -235,41 +218,16 @@ router.delete('/users/:id', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Cannot delete an admin account from here' });
     }
 
-    const label = user.username || user.email || user.userId;
+    const { label, cloudinaryCleanup } = await deleteUserAccountCascade(user);
 
-    // 1. Delete every Cloudinary file this user ever uploaded, BEFORE the
-    // Video docs (which hold the publicId/account pointers) are removed.
-    const videos = await Video.find({ userId: user._id }, 'cloudinaryPublicId cloudinaryAccount');
-    const cloudinaryEntries = videos
-      .filter((v) => v.cloudinaryPublicId)
-      .map((v) => ({ publicId: v.cloudinaryPublicId, cloudinaryAccount: v.cloudinaryAccount }));
-
-    let cloudinaryResult = { attempted: 0, deleted: 0, failed: [] };
-    if (cloudinaryEntries.length) {
-      cloudinaryResult = await deleteManyFromCloudinary(cloudinaryEntries);
-    }
-
-    // 2. Disconnect Google Drive (does not touch the user's own Drive files —
-    // see note above the route).
-    user.connectedDrive = null;
-
-    // 3 & 4. Wipe DB records, then the user doc itself.
-    await Promise.all([
-      Video.deleteMany({ userId: user._id }),
-      Transaction.deleteMany({ user: user._id }),
-      Notification.deleteMany({ user: user._id })
-    ]);
-
-    await User.findByIdAndDelete(user._id);
-
-    const storageNote = cloudinaryResult.failed.length
-      ? ` (${cloudinaryResult.failed.length} of ${cloudinaryResult.attempted} Cloudinary file(s) failed to delete — check server logs)`
+    const storageNote = cloudinaryCleanup.failed.length
+      ? ` (${cloudinaryCleanup.failed.length} of ${cloudinaryCleanup.attempted} Cloudinary file(s) failed to delete — check server logs)`
       : '';
 
     res.json({
       success: true,
       message: `${label}'s account and all associated data has been permanently deleted${storageNote}`,
-      cloudinaryCleanup: cloudinaryResult
+      cloudinaryCleanup
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

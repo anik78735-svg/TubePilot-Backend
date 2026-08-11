@@ -6,6 +6,7 @@ const User = require('../models/User');
 const { generateAccessToken, generateRefreshToken } = require('../utils/generateTokens');
 const { generateUserId, generateReferralCode } = require('../utils/idGenerator');
 const { protect } = require('../middleware/auth');
+const { deleteUserAccountCascade } = require('../utils/user');
 
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -252,6 +253,51 @@ router.post('/apply-referral', protect, async (req, res) => {
       success: true,
       message: `Referral applied! You received ${REFERRAL_SIGNUP_BONUS_DIAMONDS} bonus diamonds, and your referrer received ${REFERRER_BONUS_DIAMONDS}.`,
       diamondBalance: req.user.diamondBalance
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// @route DELETE /api/auth/delete-account
+// Self-service account deletion — required by Google Play's Account
+// Deletion policy for any app that lets users create accounts. This is the
+// USER deleting their OWN account (no id in the URL — always operates on
+// req.user, set by the `protect` middleware from their access token). The
+// admin equivalent (an admin deleting someone else's account) is
+// DELETE /api/admin/users/:id in routes/admin.js.
+//
+// Both routes call the exact same deleteUserAccountCascade() from
+// utils/user.js, so there is one source of truth for what "delete a user"
+// actually wipes (Cloudinary files, Drive disconnect, Video/Transaction/
+// Notification docs, User doc) — see utils/user.js for the full breakdown
+// and the field-name assumptions it depends on.
+//
+// Admin accounts are blocked from self-deleting here too, same as the
+// admin route blocks deleting other admins — an admin accidentally wiping
+// their own (possibly only) admin account with no recovery path is a real
+// footgun, so they're required to go through a deliberate separate process
+// for that (e.g. direct DB access), not this one-tap flow.
+router.delete('/delete-account', protect, async (req, res) => {
+  try {
+    if (req.user.role === 'admin') {
+      return res.status(400).json({
+        success: false,
+        message: 'Admin accounts cannot be deleted from the app. Contact another admin or use direct database access.'
+      });
+    }
+
+    const { cloudinaryCleanup } = await deleteUserAccountCascade(req.user);
+
+    res.clearCookie('refreshToken');
+
+    const storageNote = cloudinaryCleanup.failed.length
+      ? ` (${cloudinaryCleanup.failed.length} of ${cloudinaryCleanup.attempted} file(s) had cleanup issues — logged for review)`
+      : '';
+
+    res.json({
+      success: true,
+      message: `Your account has been permanently deleted${storageNote}`
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

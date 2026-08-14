@@ -1,7 +1,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { protect } = require('../middleware/auth');
-const { getOAuthClient, exchangeCodeForTokens, getChannelInfo } = require('../utils/youtube');
+const { getOAuthClient, exchangeCodeForTokens, getChannelInfo, refreshAccessToken } = require('../utils/youtube');
 const User = require('../models/User');
 
 const router = express.Router();
@@ -94,12 +94,84 @@ router.delete('/disconnect', protect, async (req, res) => {
 });
 
 // @route GET /api/youtube/channel
+// Returns the connected channel's info with a LIVE subscriber count.
+//
+// Previously this just read whatever was stored in the DB — which was only
+// ever set once, at the moment of OAuth connect (see /oauth/callback above).
+// That meant subscriberCount silently went stale forever: if a channel
+// grew from 100 to 10,000 subscribers after connecting, the app would keep
+// showing 100 until the user disconnected and reconnected.
+//
+// Now: every call to this route fetches fresh stats from the YouTube API
+// (refreshing the access token first if it's expired) and updates the
+// stored value before responding, so the number shown in the app is always
+// current as of whenever the profile/settings screen was last opened.
+//
+// If the live fetch fails for any reason (token revoked, API hiccup,
+// channel deleted on YouTube's side, etc.) we fall back to the last known
+// stored value instead of erroring out the whole screen — a slightly stale
+// number is a much better experience than a broken profile page.
 router.get('/channel', protect, async (req, res) => {
   if (!req.user.youtubeChannel) {
     return res.status(404).json({ success: false, message: 'No YouTube channel connected' });
   }
-  const { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } = req.user.youtubeChannel;
-  res.json({ success: true, channel: { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } });
+
+  const stored = req.user.youtubeChannel;
+  let accessToken = stored.accessToken;
+  let refreshTokenValue = stored.refreshToken;
+  let tokenExpiryDate = stored.tokenExpiryDate;
+  let needsSave = false;
+
+  try {
+    const isExpired = !tokenExpiryDate || Date.now() >= tokenExpiryDate - 60_000; // refresh 1 min early
+    if (isExpired) {
+      if (!refreshTokenValue) throw new Error('No refresh token stored — cannot refresh access token');
+      const credentials = await refreshAccessToken(refreshTokenValue);
+      accessToken = credentials.access_token;
+      tokenExpiryDate = credentials.expiry_date;
+      needsSave = true;
+    }
+
+    const channel = await getChannelInfo(accessToken);
+    if (!channel) throw new Error('Channel not found on YouTube');
+
+    const freshSubscriberCount = channel.statistics?.subscriberCount || '0';
+    const freshThumbnail = channel.snippet.thumbnails?.default?.url || stored.thumbnail;
+    const freshTitle = channel.snippet.title || stored.channelTitle;
+
+    if (
+      freshSubscriberCount !== stored.subscriberCount ||
+      freshThumbnail !== stored.thumbnail ||
+      freshTitle !== stored.channelTitle ||
+      needsSave
+    ) {
+      req.user.youtubeChannel.subscriberCount = freshSubscriberCount;
+      req.user.youtubeChannel.thumbnail = freshThumbnail;
+      req.user.youtubeChannel.channelTitle = freshTitle;
+      req.user.youtubeChannel.accessToken = accessToken;
+      req.user.youtubeChannel.tokenExpiryDate = tokenExpiryDate;
+      await req.user.save();
+    }
+
+    return res.json({
+      success: true,
+      channel: {
+        channelId: stored.channelId,
+        channelTitle: freshTitle,
+        thumbnail: freshThumbnail,
+        subscriberCount: freshSubscriberCount,
+        connectedAt: stored.connectedAt
+      }
+    });
+  } catch (err) {
+    console.error('⚠️  Live YouTube channel refresh failed, falling back to stored value:', err.message);
+    const { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } = stored;
+    return res.json({
+      success: true,
+      channel: { channelId, channelTitle, thumbnail, subscriberCount, connectedAt },
+      stale: true
+    });
+  }
 });
 
 module.exports = router;

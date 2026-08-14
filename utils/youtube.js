@@ -36,13 +36,11 @@ const uploadVideoToYouTube = async ({ accessToken, refreshToken, fileStream, tit
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
   const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-
   const status = { privacyStatus: privacyStatus || 'private', selfDeclaredMadeForKids: !!madeForKids };
   if (publishAt) {
     status.privacyStatus = 'private';
     status.publishAt = new Date(publishAt).toISOString();
   }
-
   const res = await youtube.videos.insert({
     part: 'snippet,status',
     requestBody: {
@@ -51,7 +49,6 @@ const uploadVideoToYouTube = async ({ accessToken, refreshToken, fileStream, tit
     },
     media: { body: fileStream }
   });
-
   return res.data; // includes id
 };
 
@@ -69,7 +66,6 @@ const updateVideoPrivacy = async ({ accessToken, refreshToken, videoId, privacyS
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
   const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-
   const res = await youtube.videos.update({
     part: 'status',
     requestBody: {
@@ -77,7 +73,6 @@ const updateVideoPrivacy = async ({ accessToken, refreshToken, videoId, privacyS
       status: { privacyStatus }
     }
   });
-
   return res.data;
 };
 

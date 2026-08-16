@@ -57,10 +57,15 @@ router.get('/oauth/callback', async (req, res) => {
     const { code, state } = req.query;
 
     if (!state) {
-      console.error('❌ [Drive OAuth] "state" param is missing from the callback query.');
-      console.error('❌ [Drive OAuth] This almost always means GOOGLE_DRIVE_REDIRECT_URI (in Render env vars) does not exactly match an "Authorized redirect URI" registered in Google Cloud Console → Credentials → your OAuth Client.');
-      console.error(`❌ [Drive OAuth] Current GOOGLE_DRIVE_REDIRECT_URI env value: ${process.env.GOOGLE_DRIVE_REDIRECT_URI || '(empty)'}`);
-      throw new Error('OAuth state missing — check GOOGLE_DRIVE_REDIRECT_URI matches the Authorized redirect URI in Google Cloud Console');
+      // A real Google OAuth redirect ALWAYS includes `state` (we set it
+      // ourselves when generating the auth URL). An empty-query hit on
+      // this same path is NOT a real OAuth callback — it's almost always
+      // a browser/Custom-Tab retry, prefetch, or favicon ping that fires
+      // right after the real redirect completes. Treat it as a harmless
+      // no-op instead of throwing, so it never reaches the user as a
+      // false "Failed to connect Google Drive" error.
+      console.warn('⚠️ [Drive OAuth] Callback hit with no state — ignoring (likely browser retry/prefetch, not a real OAuth redirect).');
+      return res.status(204).end();
     }
 
     if (!process.env.JWT_SECRET) {

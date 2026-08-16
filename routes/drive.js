@@ -17,6 +17,7 @@ const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
 const DRIVE_RECONNECT_DIAMOND_COST = Number(process.env.DRIVE_RECONNECT_DIAMOND_COST || 30);
 
 console.log(`ℹ️  Google Drive OAuth redirect URI configured as: ${process.env.GOOGLE_DRIVE_REDIRECT_URI || '⚠️ EMPTY — check GOOGLE_DRIVE_REDIRECT_URI in .env'}`);
+console.log(`ℹ️  JWT_SECRET is ${process.env.JWT_SECRET ? 'set (length ' + process.env.JWT_SECRET.length + ')' : '⚠️ EMPTY — check JWT_SECRET in .env'}`);
 
 // @route GET /api/drive/oauth/url?platform=mobile|web
 router.get('/oauth/url', protect, (req, res) => {
@@ -29,6 +30,11 @@ router.get('/oauth/url', protect, (req, res) => {
     scope: DRIVE_SCOPES,
     state
   });
+
+  // DIAGNOSTIC LOG — confirms the state we signed here, so we can compare
+  // it against whatever (if anything) actually comes back in the callback.
+  console.log(`🔗 [Drive OAuth] Generated auth URL for user ${req.user._id} (platform=${platform}). state length=${state.length}. Full URL: ${url}`);
+
   res.json({ success: true, url });
 });
 
@@ -40,10 +46,32 @@ router.get('/oauth/url', protect, (req, res) => {
 // the new connectedDrive and redirect back with an insufficient-diamonds error.
 router.get('/oauth/callback', async (req, res) => {
   let platform = 'web';
+
+  // DIAGNOSTIC LOG — shows EXACTLY what Google sent back on the redirect.
+  // If `state` is missing/empty here, the problem is 100% on the Google
+  // Cloud Console / redirect URI side, not in this route's code.
+  console.log(`🔗 [Drive OAuth] Callback hit. Full query received:`, JSON.stringify(req.query));
+  console.log(`🔗 [Drive OAuth] Raw request URL: ${req.originalUrl}`);
+
   try {
     const { code, state } = req.query;
+
+    if (!state) {
+      console.error('❌ [Drive OAuth] "state" param is missing from the callback query.');
+      console.error('❌ [Drive OAuth] This almost always means GOOGLE_DRIVE_REDIRECT_URI (in Render env vars) does not exactly match an "Authorized redirect URI" registered in Google Cloud Console → Credentials → your OAuth Client.');
+      console.error(`❌ [Drive OAuth] Current GOOGLE_DRIVE_REDIRECT_URI env value: ${process.env.GOOGLE_DRIVE_REDIRECT_URI || '(empty)'}`);
+      throw new Error('OAuth state missing — check GOOGLE_DRIVE_REDIRECT_URI matches the Authorized redirect URI in Google Cloud Console');
+    }
+
+    if (!process.env.JWT_SECRET) {
+      console.error('❌ [Drive OAuth] JWT_SECRET env var is empty — cannot verify state.');
+      throw new Error('Server misconfiguration: JWT_SECRET is not set');
+    }
+
     const decoded = jwt.verify(state, process.env.JWT_SECRET);
     platform = decoded.platform || 'web';
+    console.log(`✅ [Drive OAuth] state verified OK. userId=${decoded.id}, platform=${platform}`);
+
     const user = await User.findById(decoded.id);
     if (!user) throw new Error('User not found');
 
@@ -86,6 +114,8 @@ router.get('/oauth/callback', async (req, res) => {
     };
     user.driveConnectCount = (user.driveConnectCount || 0) + 1;
     await user.save();
+
+    console.log(`✅ [Drive OAuth] Drive connected successfully for user ${user._id} (${accountInfo?.emailAddress || 'unknown email'})`);
 
     if (platform === 'mobile') {
       res.redirect('tubepilot://oauth-success?drive_connected=1');

@@ -363,29 +363,51 @@ const startFreeUploadReset = () => {
   console.log('📅 Monthly free-upload reset job is running');
 };
 
+// -----------------------------------------------------------------------
+// DIAGNOSTIC LOGGING ADDED BELOW: this function used to fail/skip silently
+// with NO console output at all, so when a Drive-connected user's daily
+// upload didn't happen, there was zero way to tell from the logs whether:
+//   a) the scheduler tick never found the user due (wrong dailyUploadTime
+//      match, or lastAutoUploadDate already == today),
+//   b) the Drive file listing came back empty / didn't match the folder,
+//   c) every file in the folder was already in driveProcessedFileIds,
+//   d) the diamond/free-upload charge failed, or
+//   e) the actual Video.create() + Drive download step threw.
+// Now every branch logs exactly what happened, so future silent-skip
+// reports can be diagnosed straight from Render logs instead of guessing.
+// -----------------------------------------------------------------------
 const runDriveAutoUploadForUser = async (user, todayStr) => {
+  console.log(`📁 [Drive Auto-Upload] Running for user ${user._id} (${user.connectedDrive?.email || 'unknown email'}), folderId=${user.connectedDrive?.folderId || '(whole drive)'}`);
+
   try {
     if (!user.youtubeChannel) {
+      console.warn(`⚠️ [Drive Auto-Upload] User ${user._id} has Drive connected but NO YouTube channel connected — skipping, marking today as done.`);
       user.connectedDrive.lastAutoUploadDate = todayStr;
       await user.save();
       return;
     }
 
     const files = await listUserDriveVideoFiles(user);
+    console.log(`📁 [Drive Auto-Upload] User ${user._id}: found ${files.length} video file(s) in Drive scope. Names: ${files.map((f) => f.name).join(', ') || '(none)'}`);
+
     const processedIds = user.connectedDrive.driveProcessedFileIds || [];
     const nextFile = files.find((f) => !processedIds.includes(f.id));
 
     user.connectedDrive.lastAutoUploadDate = todayStr;
 
     if (!nextFile) {
+      console.warn(`⚠️ [Drive Auto-Upload] User ${user._id}: no NEW file to upload (${files.length} found, ${processedIds.length} already processed). Nothing to do today.`);
       await user.save();
       return;
     }
+
+    console.log(`📁 [Drive Auto-Upload] User ${user._id}: picked file "${nextFile.name}" (id=${nextFile.id}, mimeType=${nextFile.mimeType}, size=${nextFile.size}) to upload.`);
 
     let charge;
     try {
       charge = chargeForUpload(user);
     } catch (err) {
+      console.warn(`⚠️ [Drive Auto-Upload] User ${user._id}: charge failed — ${err.message}`);
       await user.save();
       if (err.code === 'INSUFFICIENT_DIAMONDS') {
         sendOneSignalToUser(user, {
@@ -398,6 +420,8 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
     }
 
     const buffer = await downloadUserDriveFileBuffer(user, nextFile.id);
+    console.log(`📁 [Drive Auto-Upload] User ${user._id}: downloaded "${nextFile.name}" (${buffer.length} bytes) from Drive, now storing + queueing for YouTube upload...`);
+
     const stored = await storeVideoFile(buffer, `${user.userId}_drive_${Date.now()}`, nextFile.mimeType || 'video/mp4');
 
     await Video.create({
@@ -424,8 +448,11 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
     user.storageUsedBytes += buffer.length;
     user.connectedDrive.driveProcessedFileIds = [...processedIds, nextFile.id];
     await user.save();
+
+    console.log(`✅ [Drive Auto-Upload] User ${user._id}: Video doc created for "${nextFile.name}" with status 'queued' — the normal publish scheduler tick will pick it up and push it to YouTube within the next minute.`);
   } catch (err) {
-    console.error(`Drive auto-upload failed for user ${user._id}:`, err.message);
+    console.error(`❌ [Drive Auto-Upload] FAILED for user ${user._id}:`, err.message);
+    console.error(err.stack);
   }
 };
 
@@ -439,6 +466,9 @@ const startDriveAutoUploadScheduler = () => {
         'connectedDrive.dailyUploadTime': hhmm,
         'connectedDrive.lastAutoUploadDate': { $ne: todayStr }
       });
+      if (dueUsers.length > 0) {
+        console.log(`📁 [Drive Auto-Upload] Tick at ${hhmm}: found ${dueUsers.length} user(s) due for Drive auto-upload today.`);
+      }
       for (const user of dueUsers) {
         await runDriveAutoUploadForUser(user, todayStr);
       }

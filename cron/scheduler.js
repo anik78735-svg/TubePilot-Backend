@@ -456,27 +456,63 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
   }
 };
 
+// ⚠️ CRITICAL FIX: Render's server clock runs in UTC. The Flutter app's
+// "Daily Upload Time" picker shows/saves whatever the USER'S PHONE clock
+// says — which for Indian users is IST (UTC+5:30). Previously this
+// scheduler compared that IST string (e.g. "13:56") directly against the
+// SERVER's UTC hh:mm — which is 5 hours 30 minutes behind, so the two
+// values could NEVER match. That's why runDriveAutoUploadForUser() never
+// fired and nothing ever showed up in the logs — the whole function was
+// unreachable, silently, forever.
+//
+// Fix: convert the server's current UTC time to IST before comparing
+// against the stored dailyUploadTime (which is effectively an IST
+// wall-clock string, since that's what the user picked on their phone).
+// IST = UTC + 5 hours 30 minutes, with no daylight-saving changes to worry
+// about (India doesn't observe DST).
+const IST_OFFSET_MINUTES = 5 * 60 + 30;
+
+const getCurrentISTHHMM = () => {
+  const nowUtcMs = Date.now();
+  const istMs = nowUtcMs + IST_OFFSET_MINUTES * 60 * 1000;
+  const istDate = new Date(istMs);
+  const hh = String(istDate.getUTCHours()).padStart(2, '0');
+  const mm = String(istDate.getUTCMinutes()).padStart(2, '0');
+  return { hhmm: `${hh}:${mm}`, istDate };
+};
+
 const startDriveAutoUploadScheduler = () => {
   cron.schedule('* * * * *', async () => {
     try {
-      const now = new Date();
-      const hhmm = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-      const todayStr = now.toISOString().slice(0, 10);
+      const { hhmm, istDate } = getCurrentISTHHMM();
+      // "today" must also be computed in IST, not UTC, otherwise a user
+      // whose upload time is e.g. 00:15 IST would compare against the
+      // wrong calendar day right around the UTC/IST date rollover.
+      const todayStr = istDate.toISOString().slice(0, 10);
+
+      // ALWAYS log the tick (every single minute) so it's immediately
+      // obvious from Render logs that the cron job is alive and what time
+      // it thinks it is right now — no more guessing whether the process
+      // is even running.
+      console.log(`📁 [Drive Auto-Upload] Tick — server time (IST): ${hhmm} on ${todayStr}`);
+
       const dueUsers = await User.find({
         'connectedDrive.dailyUploadTime': hhmm,
         'connectedDrive.lastAutoUploadDate': { $ne: todayStr }
       });
+
       if (dueUsers.length > 0) {
-        console.log(`📁 [Drive Auto-Upload] Tick at ${hhmm}: found ${dueUsers.length} user(s) due for Drive auto-upload today.`);
+        console.log(`📁 [Drive Auto-Upload] MATCH at ${hhmm}: found ${dueUsers.length} user(s) due for Drive auto-upload today.`);
       }
       for (const user of dueUsers) {
         await runDriveAutoUploadForUser(user, todayStr);
       }
     } catch (err) {
-      console.error('Drive auto-upload scheduler tick error:', err.message);
+      console.error('❌ Drive auto-upload scheduler tick error:', err.message);
+      console.error(err.stack);
     }
   });
-  console.log('📁 Drive auto-upload scheduler is running (checks every minute)');
+  console.log('📁 Drive auto-upload scheduler is running (checks every minute, IST-aware)');
 };
 
 module.exports = {

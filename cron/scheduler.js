@@ -43,12 +43,6 @@ const ensureFreshYouTubeToken = async (user) => {
     await user.save();
     return credentials.access_token;
   } catch (err) {
-    // invalid_grant means the refresh_token itself is permanently
-    // invalid/expired/revoked (e.g. user revoked access, password reset,
-    // or Google silently invalidated it). Retrying this same refresh_token
-    // will NEVER succeed — the user must reconnect their YouTube account
-    // via the OAuth consent flow again. We tag the error so callers can
-    // stop retrying immediately instead of wasting MAX_RETRIES attempts.
     if (isInvalidGrantError(err)) {
       const reauthErr = new Error('Your YouTube authorization has expired or was revoked. Please reconnect your YouTube account.');
       reauthErr.code = 'YOUTUBE_REAUTH_REQUIRED';
@@ -67,6 +61,12 @@ const ensureFreshYouTubeToken = async (user) => {
 //     the moment scheduledAt arrives — no re-upload needed, just a fast
 //     metadata patch.
 //   - If there's no scheduledAt, we upload directly with the target privacy.
+//
+// This exact flow is what Drive auto-upload now relies on for Problem 2:
+// runDriveAutoUploadForUser() (below) creates the Video with scheduledAt
+// set to the user's chosen "Daily Upload Time" — so it uploads unlisted at
+// 06:00 IST and this same promoteScheduledYouTubeVideos() tick promotes it
+// to public later, with zero new upload logic needed.
 // -----------------------------------------------------------------------
 const publishToYouTube = async (video, target, user) => {
   const accessToken = await ensureFreshYouTubeToken(user);
@@ -87,20 +87,13 @@ const publishToYouTube = async (video, target, user) => {
     madeForKids: target.audience === 'made_for_kids'
   });
 
-  // Remember what privacy this target should end up at once scheduledAt
-  // arrives (falls back to whatever was already set on the target).
   target.targetPrivacyStatus = target.targetPrivacyStatus || target.privacyStatus || 'public';
   target.privacyStatus = uploadPrivacy;
-  target.youtubePrivacyPromoted = !hasFutureSchedule; // true once it's at its final privacy
+  target.youtubePrivacyPromoted = !hasFutureSchedule;
 
   return { platformPostId: result.id, platformUrl: `https://youtube.com/watch?v=${result.id}` };
 };
 
-// NOTE: Facebook Reels don't have an "unlisted, promote later" concept via
-// the Graph API — a published Reel is live immediately. So for Facebook,
-// "scheduling" just controls WHEN we call publishFacebookReel (handled by
-// the normal pending -> queued promotion below), not a two-step
-// upload-then-promote flow like YouTube.
 const publishToFacebook = async (video, target, user) => {
   if (!user.connectedFacebook) throw new Error('Facebook is not connected');
   const caption = [target.caption, ...(target.hashtags || []).map((h) => `#${h.replace(/^#/, '')}`)].filter(Boolean).join('\n\n');
@@ -162,10 +155,6 @@ const processVideoTargets = async (video) => {
       target.failReason = err.message;
       target.status = 'failed';
 
-      // YouTube refresh_token permanently invalid/revoked: retrying will
-      // never succeed until the user reconnects their account, so stop
-      // burning retry attempts and send a distinct, actionable notification
-      // instead of the generic "retrying automatically" message.
       const needsYouTubeReauth = target.platform === 'youtube' && err.code === 'YOUTUBE_REAUTH_REQUIRED';
 
       if (needsYouTubeReauth) {
@@ -209,11 +198,6 @@ const processVideoTargets = async (video) => {
   video.recomputeStatus();
   await video.save();
 
-  // Only delete the stored source file once every target is fully done
-  // (uploaded) or has exhausted retries. IMPORTANT: a YouTube target that's
-  // uploaded-but-still-unlisted (waiting to be promoted to public) still
-  // counts as "uploaded" here — promotion only needs a metadata patch, not
-  // the original file, so it's safe to delete at that point.
   const stillNeedsFile = video.platforms.some((t) =>
     t.status === 'pending' || t.status === 'queued' || t.status === 'processing' ||
     (t.status === 'failed' && t.retryCount < MAX_RETRIES)
@@ -228,6 +212,11 @@ const processVideoTargets = async (video) => {
 // Promotes YouTube targets that were uploaded early as 'unlisted' to their
 // real target privacy (usually 'public') the moment scheduledAt arrives.
 // This does NOT re-upload the video — it's a fast videos.update() patch.
+//
+// For Drive auto-upload (Problem 2), this IS the "second cron job that
+// goes public at the user's set time" — no separate cron needed, this
+// already runs every minute as part of startPublishScheduler and reacts
+// to whatever scheduledAt was stamped on the target when it was created.
 // -----------------------------------------------------------------------
 const promoteScheduledYouTubeVideos = async () => {
   const now = new Date();
@@ -284,9 +273,6 @@ const startPublishScheduler = () => {
     try {
       const now = new Date();
 
-      // Facebook (and any other non-YouTube platform) has no "upload early,
-      // reveal later" option, so its targets stay 'pending' until
-      // scheduledAt, then get promoted to 'queued' here like before.
       const promoted = await Video.updateMany(
         { 'platforms.status': 'pending', 'platforms.scheduledAt': { $lte: now }, 'platforms.platform': { $ne: 'youtube' } },
         { $set: { 'platforms.$[elem].status': 'queued' } },
@@ -296,10 +282,6 @@ const startPublishScheduler = () => {
         console.log(`ℹ️ [Scheduler] Promoted ${promoted.modifiedCount} video doc(s) from pending -> queued (scheduled time reached)`);
       }
 
-      // YouTube targets upload immediately regardless of scheduledAt (as
-      // unlisted if scheduled for later), so they go straight to 'queued'
-      // as soon as they're created — see routes/video.js. This tick just
-      // picks up anything sitting queued (any platform) and processes it.
       const dueVideos = await Video.find({ 'platforms.status': 'queued' }).limit(10);
       if (dueVideos.length > 0) {
         console.log(`▶️ [Scheduler] Tick found ${dueVideos.length} video(s) with queued platform target(s)`);
@@ -308,8 +290,6 @@ const startPublishScheduler = () => {
         await processVideoTargets(video);
       }
 
-      // Flip already-uploaded YouTube videos from unlisted -> their real
-      // target privacy once their scheduled time has arrived.
       await promoteScheduledYouTubeVideos();
     } catch (err) {
       console.error('❌ [Scheduler] Publish scheduler tick error:', err.message);
@@ -318,9 +298,6 @@ const startPublishScheduler = () => {
   console.log('⏰ Multi-platform publish scheduler is running (checks every minute)');
 };
 
-// Retries failed targets under the retry limit. Only logs when it actually
-// promotes something — fixes the previous version which logged this line on
-// EVERY tick even when there was nothing to retry.
 const startRetryScheduler = () => {
   cron.schedule('*/15 * * * *', async () => {
     try {
@@ -364,17 +341,55 @@ const startFreeUploadReset = () => {
 };
 
 // -----------------------------------------------------------------------
-// DIAGNOSTIC LOGGING ADDED BELOW: this function used to fail/skip silently
-// with NO console output at all, so when a Drive-connected user's daily
-// upload didn't happen, there was zero way to tell from the logs whether:
-//   a) the scheduler tick never found the user due (wrong dailyUploadTime
-//      match, or lastAutoUploadDate already == today),
-//   b) the Drive file listing came back empty / didn't match the folder,
-//   c) every file in the folder was already in driveProcessedFileIds,
-//   d) the diamond/free-upload charge failed, or
-//   e) the actual Video.create() + Drive download step threw.
-// Now every branch logs exactly what happened, so future silent-skip
-// reports can be diagnosed straight from Render logs instead of guessing.
+// Timezone helpers. Render's server clock runs in UTC, but every time
+// value the user sets (and every "today" boundary) needs to be evaluated
+// in IST (UTC+5:30 — India doesn't observe DST). getCurrentISTHHMM() gives
+// the current wall-clock time/date in IST; buildISTInstant() converts an
+// IST calendar date + HH:mm wall-clock time into the correct absolute UTC
+// Date instant.
+// -----------------------------------------------------------------------
+const IST_OFFSET_MINUTES = 5 * 60 + 30;
+
+const getCurrentISTHHMM = () => {
+  const nowUtcMs = Date.now();
+  const istMs = nowUtcMs + IST_OFFSET_MINUTES * 60 * 1000;
+  const istDate = new Date(istMs);
+  const hh = String(istDate.getUTCHours()).padStart(2, '0');
+  const mm = String(istDate.getUTCMinutes()).padStart(2, '0');
+  return { hhmm: `${hh}:${mm}`, istDate };
+};
+
+// istDateStr: 'YYYY-MM-DD' (IST calendar day), hhmm: 'HH:mm' (IST wall clock)
+// Returns the real UTC Date instant that wall-clock moment corresponds to.
+const buildISTInstant = (istDateStr, hhmm) => {
+  const [hh, mm] = hhmm.split(':').map(Number);
+  const asIfUTC = new Date(`${istDateStr}T${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00.000Z`);
+  return new Date(asIfUTC.getTime() - IST_OFFSET_MINUTES * 60 * 1000);
+};
+
+// Days between two 'YYYY-MM-DD' strings (calendar days, not exact 24h blocks).
+const daysBetweenDateStrings = (fromStr, toStr) => {
+  const from = new Date(`${fromStr}T00:00:00.000Z`);
+  const to = new Date(`${toStr}T00:00:00.000Z`);
+  return Math.round((to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000));
+};
+
+// -----------------------------------------------------------------------
+// Drive auto-upload for one user, fixed to run at 06:00 IST daily.
+//
+// Flow (Problem 2 requirements):
+//   1. Pull the next un-processed video from the user's Drive scope.
+//   2. Upload it to YouTube RIGHT NOW (06:00 IST) as 'unlisted', with
+//      scheduledAt = today's date + the user's chosen "Daily Upload Time".
+//      publishToYouTube() (above) already knows how to do this — it just
+//      needs a Video doc with status 'queued' and a future scheduledAt.
+//   3. The existing promoteScheduledYouTubeVideos() tick (runs every
+//      minute) flips it to public the moment that scheduledAt arrives —
+//      no separate/new cron needed for that half.
+//   4. If there's NO new video in Drive, mark today as a "no video" day.
+//      The first time this happens, notify the user. If it stays empty for
+//      2 IST calendar days in a row, auto-disconnect Drive (see
+//      checkDriveInactivityAndDisconnect below) and notify.
 // -----------------------------------------------------------------------
 const runDriveAutoUploadForUser = async (user, todayStr) => {
   console.log(`📁 [Drive Auto-Upload] Running for user ${user._id} (${user.connectedDrive?.email || 'unknown email'}), folderId=${user.connectedDrive?.folderId || '(whole drive)'}`);
@@ -396,10 +411,39 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
     user.connectedDrive.lastAutoUploadDate = todayStr;
 
     if (!nextFile) {
-      console.warn(`⚠️ [Drive Auto-Upload] User ${user._id}: no NEW file to upload (${files.length} found, ${processedIds.length} already processed). Nothing to do today.`);
+      // Nothing new to upload today. Track how long this has been true so
+      // the 2-day auto-disconnect rule and the "video exhausted" notice
+      // (sent once, not every day) can key off it.
+      const wasAlreadyEmpty = !!user.connectedDrive.noNewVideoSinceDate;
+      if (!wasAlreadyEmpty) {
+        user.connectedDrive.noNewVideoSinceDate = todayStr;
+        console.warn(`⚠️ [Drive Auto-Upload] User ${user._id}: Drive has no new video — starting inactivity tracking from ${todayStr}.`);
+
+        await Notification.create({
+          user: user._id,
+          type: 'upload_failed',
+          title: 'No New Video Found in Drive 📁',
+          message: 'Your Drive folder has no new video to upload today. Add a new video, or your Drive will auto-disconnect after 2 days with nothing new.'
+        });
+        await sendPushToUser(user, {
+          title: 'No new video in your Drive 📁',
+          body: 'Add a new video soon — Drive auto-disconnects after 2 days with nothing new to upload.',
+          data: { type: 'drive_no_new_video' }
+        });
+        sendOneSignalToUser(user, {
+          title: 'No new video in your Drive 📁',
+          body: 'Add a new video soon — Drive auto-disconnects after 2 days with nothing new to upload.',
+          data: { type: 'drive_no_new_video' }
+        }).catch(() => {});
+      } else {
+        console.warn(`⚠️ [Drive Auto-Upload] User ${user._id}: still no new video (empty since ${user.connectedDrive.noNewVideoSinceDate}).`);
+      }
       await user.save();
       return;
     }
+
+    // Found a video — clear any inactivity tracking from previous empty days.
+    user.connectedDrive.noNewVideoSinceDate = null;
 
     console.log(`📁 [Drive Auto-Upload] User ${user._id}: picked file "${nextFile.name}" (id=${nextFile.id}, mimeType=${nextFile.mimeType}, size=${nextFile.size}) to upload.`);
 
@@ -424,6 +468,18 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
 
     const stored = await storeVideoFile(buffer, `${user.userId}_drive_${Date.now()}`, nextFile.mimeType || 'video/mp4');
 
+    // Go-public time: the user's "Daily Upload Time" setting, applied to
+    // TODAY's IST calendar date. If the user hasn't set one, publish
+    // straight away (no unlisted staging step) rather than blocking the
+    // whole flow on a missing setting.
+    const dailyTime = user.connectedDrive.dailyUploadTime;
+    const scheduledAt = dailyTime ? buildISTInstant(todayStr, dailyTime) : null;
+    if (scheduledAt) {
+      console.log(`📁 [Drive Auto-Upload] User ${user._id}: video will upload unlisted now and go public at ${scheduledAt.toISOString()} (UTC) = ${dailyTime} IST.`);
+    } else {
+      console.log(`📁 [Drive Auto-Upload] User ${user._id}: no Daily Upload Time set — publishing directly as public, no unlisted staging.`);
+    }
+
     await Video.create({
       user: user._id,
       storageProvider: stored.storageProvider,
@@ -441,6 +497,7 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
         title: nextFile.name || 'Untitled',
         privacyStatus: 'public',
         targetPrivacyStatus: 'public',
+        scheduledAt,
         youtubePrivacyPromoted: false
       }]
     });
@@ -449,70 +506,91 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
     user.connectedDrive.driveProcessedFileIds = [...processedIds, nextFile.id];
     await user.save();
 
-    console.log(`✅ [Drive Auto-Upload] User ${user._id}: Video doc created for "${nextFile.name}" with status 'queued' — the normal publish scheduler tick will pick it up and push it to YouTube within the next minute.`);
+    console.log(`✅ [Drive Auto-Upload] User ${user._id}: Video doc created for "${nextFile.name}" with status 'queued' — the publish scheduler will upload it (unlisted, if scheduled) within the next minute, then promote to public at the scheduled time.`);
   } catch (err) {
     console.error(`❌ [Drive Auto-Upload] FAILED for user ${user._id}:`, err.message);
     console.error(err.stack);
   }
 };
 
-// ⚠️ CRITICAL FIX: Render's server clock runs in UTC. The Flutter app's
-// "Daily Upload Time" picker shows/saves whatever the USER'S PHONE clock
-// says — which for Indian users is IST (UTC+5:30). Previously this
-// scheduler compared that IST string (e.g. "13:56") directly against the
-// SERVER's UTC hh:mm — which is 5 hours 30 minutes behind, so the two
-// values could NEVER match. That's why runDriveAutoUploadForUser() never
-// fired and nothing ever showed up in the logs — the whole function was
-// unreachable, silently, forever.
-//
-// Fix: convert the server's current UTC time to IST before comparing
-// against the stored dailyUploadTime (which is effectively an IST
-// wall-clock string, since that's what the user picked on their phone).
-// IST = UTC + 5 hours 30 minutes, with no daylight-saving changes to worry
-// about (India doesn't observe DST).
-const IST_OFFSET_MINUTES = 5 * 60 + 30;
+// -----------------------------------------------------------------------
+// Auto-disconnects any user's Drive that has gone 2+ IST calendar days
+// with no new video found (noNewVideoSinceDate set and stale by >= 2 days).
+// Runs once daily, shortly after the 06:00 upload attempt.
+// -----------------------------------------------------------------------
+const checkDriveInactivityAndDisconnect = async (todayStr) => {
+  const candidates = await User.find({
+    'connectedDrive.noNewVideoSinceDate': { $ne: null }
+  });
 
-const getCurrentISTHHMM = () => {
-  const nowUtcMs = Date.now();
-  const istMs = nowUtcMs + IST_OFFSET_MINUTES * 60 * 1000;
-  const istDate = new Date(istMs);
-  const hh = String(istDate.getUTCHours()).padStart(2, '0');
-  const mm = String(istDate.getUTCMinutes()).padStart(2, '0');
-  return { hhmm: `${hh}:${mm}`, istDate };
+  for (const user of candidates) {
+    const since = user.connectedDrive?.noNewVideoSinceDate;
+    if (!since) continue;
+    const idleDays = daysBetweenDateStrings(since, todayStr);
+    if (idleDays < 2) continue;
+
+    console.log(`📁 [Drive Auto-Upload] User ${user._id}: no new video for ${idleDays} day(s) (since ${since}) — auto-disconnecting Drive.`);
+
+    user.connectedDrive = null;
+    await user.save();
+
+    await Notification.create({
+      user: user._id,
+      type: 'upload_failed',
+      title: 'Google Drive Auto-Disconnected 🔌',
+      message: `No new video was found in your Drive for ${idleDays} days, so it has been automatically disconnected. Reconnect anytime to resume auto-upload.`
+    });
+    await sendPushToUser(user, {
+      title: 'Drive auto-disconnected 🔌',
+      body: 'No new video for 2 days, so your Drive was disconnected. Reconnect anytime.',
+      data: { type: 'drive_auto_disconnected' }
+    });
+    sendOneSignalToUser(user, {
+      title: 'Drive auto-disconnected 🔌',
+      body: 'No new video for 2 days, so your Drive was disconnected. Reconnect anytime.',
+      data: { type: 'drive_auto_disconnected' }
+    }).catch(() => {});
+  }
 };
 
 const startDriveAutoUploadScheduler = () => {
   cron.schedule('* * * * *', async () => {
     try {
       const { hhmm, istDate } = getCurrentISTHHMM();
-      // "today" must also be computed in IST, not UTC, otherwise a user
-      // whose upload time is e.g. 00:15 IST would compare against the
-      // wrong calendar day right around the UTC/IST date rollover.
       const todayStr = istDate.toISOString().slice(0, 10);
 
-      // ALWAYS log the tick (every single minute) so it's immediately
-      // obvious from Render logs that the cron job is alive and what time
-      // it thinks it is right now — no more guessing whether the process
-      // is even running.
-      console.log(`📁 [Drive Auto-Upload] Tick — server time (IST): ${hhmm} on ${todayStr}`);
+      console.log(`📁 [Drive Auto-Upload] Tick — IST time: ${hhmm} on ${todayStr}`);
 
-      const dueUsers = await User.find({
-        'connectedDrive.dailyUploadTime': hhmm,
-        'connectedDrive.lastAutoUploadDate': { $ne: todayStr }
-      });
+      // Fixed 06:00 IST trigger for EVERY Drive-connected user, regardless
+      // of their individual "Daily Upload Time" — that setting now only
+      // controls when the video goes public (handled by
+      // promoteScheduledYouTubeVideos in the publish scheduler), not when
+      // it's pulled from Drive and uploaded unlisted.
+      if (hhmm === '06:00') {
+        const dueUsers = await User.find({
+          connectedDrive: { $ne: null },
+          'connectedDrive.lastAutoUploadDate': { $ne: todayStr }
+        });
 
-      if (dueUsers.length > 0) {
-        console.log(`📁 [Drive Auto-Upload] MATCH at ${hhmm}: found ${dueUsers.length} user(s) due for Drive auto-upload today.`);
+        if (dueUsers.length > 0) {
+          console.log(`📁 [Drive Auto-Upload] 06:00 IST trigger: found ${dueUsers.length} Drive-connected user(s) due for today.`);
+        }
+        for (const user of dueUsers) {
+          await runDriveAutoUploadForUser(user, todayStr);
+        }
       }
-      for (const user of dueUsers) {
-        await runDriveAutoUploadForUser(user, todayStr);
+
+      // Runs once a day, shortly after the 06:00 trigger above so today's
+      // upload attempt has already updated noNewVideoSinceDate.
+      if (hhmm === '06:05') {
+        await checkDriveInactivityAndDisconnect(todayStr);
       }
     } catch (err) {
       console.error('❌ Drive auto-upload scheduler tick error:', err.message);
       console.error(err.stack);
     }
   });
-  console.log('📁 Drive auto-upload scheduler is running (checks every minute, IST-aware)');
+  console.log('📁 Drive auto-upload scheduler is running (fixed 06:00 IST pull + unlisted upload, 06:05 inactivity check; go-public time still controlled by promoteScheduledYouTubeVideos)');
 };
 
 module.exports = {

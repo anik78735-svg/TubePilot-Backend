@@ -20,9 +20,20 @@ const ConnectedDriveSchema = new mongoose.Schema({
   tokenExpiryDate: Number,
   folderId: { type: String, default: null },
   folderName: { type: String, default: null },
+  // 'HH:mm' wall-clock time (IST) the user picked in "Daily Upload Time".
+  // This is the time the auto-uploaded video should go PUBLIC. The actual
+  // pull-from-Drive + unlisted-upload always happens at a fixed 06:00 IST
+  // (see backend/cron/scheduler.js) — dailyUploadTime only controls the
+  // later unlisted -> public promotion.
   dailyUploadTime: { type: String, default: null },
   lastAutoUploadDate: { type: String, default: null },
   driveProcessedFileIds: [{ type: String }],
+  // 'YYYY-MM-DD' (IST) of the first day the 06:00 Drive scan found NO new
+  // video to upload. Reset to null as soon as a new video is found again.
+  // If this stays set for >= 2 calendar days in a row, the scheduler
+  // auto-disconnects this user's Drive (see checkDriveInactivityAndDisconnect
+  // in backend/cron/scheduler.js).
+  noNewVideoSinceDate: { type: String, default: null },
   connectedAt: { type: Date, default: Date.now }
 }, { _id: false });
 

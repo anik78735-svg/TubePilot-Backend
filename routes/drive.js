@@ -31,8 +31,6 @@ router.get('/oauth/url', protect, (req, res) => {
     state
   });
 
-  // DIAGNOSTIC LOG — confirms the state we signed here, so we can compare
-  // it against whatever (if anything) actually comes back in the callback.
   console.log(`🔗 [Drive OAuth] Generated auth URL for user ${req.user._id} (platform=${platform}). state length=${state.length}. Full URL: ${url}`);
 
   res.json({ success: true, url });
@@ -47,9 +45,6 @@ router.get('/oauth/url', protect, (req, res) => {
 router.get('/oauth/callback', async (req, res) => {
   let platform = 'web';
 
-  // DIAGNOSTIC LOG — shows EXACTLY what Google sent back on the redirect.
-  // If `state` is missing/empty here, the problem is 100% on the Google
-  // Cloud Console / redirect URI side, not in this route's code.
   console.log(`🔗 [Drive OAuth] Callback hit. Full query received:`, JSON.stringify(req.query));
   console.log(`🔗 [Drive OAuth] Raw request URL: ${req.originalUrl}`);
 
@@ -57,13 +52,6 @@ router.get('/oauth/callback', async (req, res) => {
     const { code, state } = req.query;
 
     if (!state) {
-      // A real Google OAuth redirect ALWAYS includes `state` (we set it
-      // ourselves when generating the auth URL). An empty-query hit on
-      // this same path is NOT a real OAuth callback — it's almost always
-      // a browser/Custom-Tab retry, prefetch, or favicon ping that fires
-      // right after the real redirect completes. Treat it as a harmless
-      // no-op instead of throwing, so it never reaches the user as a
-      // false "Failed to connect Google Drive" error.
       console.warn('⚠️ [Drive OAuth] Callback hit with no state — ignoring (likely browser retry/prefetch, not a real OAuth redirect).');
       return res.status(204).end();
     }
@@ -104,23 +92,41 @@ router.get('/oauth/callback', async (req, res) => {
       user.diamondBalance -= DRIVE_RECONNECT_DIAMOND_COST;
     }
 
+    // ⚠️ FIX: previously this ALWAYS reset folderId/folderName/
+    // lastAutoUploadDate/driveProcessedFileIds/noNewVideoSinceDate to
+    // null/empty on every OAuth callback — including when it was the SAME
+    // Google account reconnecting (e.g. an access-token refresh flow, or
+    // the user tapping "Connect" again after a token expiry). That silently
+    // wiped the user's chosen folder every time this route ran for a
+    // reason unrelated to actually switching accounts — this was the root
+    // cause behind "folder apne aap change ho jaata hai".
+    //
+    // Fix: only wipe folder/upload-progress state when the connecting
+    // account's email is actually DIFFERENT from what was already
+    // connected. Reconnecting the same account now preserves everything
+    // the user already configured.
+    const previousEmail = user.connectedDrive?.email || null;
+    const newEmail = accountInfo?.emailAddress || '';
+    const isSameAccount = previousEmail && previousEmail === newEmail;
+
     user.connectedDrive = {
-      email: accountInfo?.emailAddress || '',
+      email: newEmail,
       displayName: accountInfo?.displayName || '',
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token || user.connectedDrive?.refreshToken,
       tokenExpiryDate: tokens.expiry_date,
-      folderId: null, // always reset scope on a fresh connect — user re-picks the folder
-      folderName: null,
+      folderId: isSameAccount ? (user.connectedDrive?.folderId ?? null) : null,
+      folderName: isSameAccount ? (user.connectedDrive?.folderName ?? null) : null,
       dailyUploadTime: user.connectedDrive?.dailyUploadTime || null,
-      lastAutoUploadDate: null,
-      driveProcessedFileIds: [],
+      lastAutoUploadDate: isSameAccount ? (user.connectedDrive?.lastAutoUploadDate ?? null) : null,
+      driveProcessedFileIds: isSameAccount ? (user.connectedDrive?.driveProcessedFileIds || []) : [],
+      noNewVideoSinceDate: isSameAccount ? (user.connectedDrive?.noNewVideoSinceDate ?? null) : null,
       connectedAt: new Date()
     };
     user.driveConnectCount = (user.driveConnectCount || 0) + 1;
     await user.save();
 
-    console.log(`✅ [Drive OAuth] Drive connected successfully for user ${user._id} (${accountInfo?.emailAddress || 'unknown email'})`);
+    console.log(`✅ [Drive OAuth] Drive connected successfully for user ${user._id} (${newEmail || 'unknown email'}). sameAccountReconnect=${isSameAccount}`);
 
     if (platform === 'mobile') {
       res.redirect('tubepilot://oauth-success?drive_connected=1');
@@ -128,8 +134,6 @@ router.get('/oauth/callback', async (req, res) => {
       res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?drive_connected=1`);
     }
   } catch (err) {
-    // Logged with full detail so Render logs show the real cause
-    // (redirect_uri_mismatch on GOOGLE_DRIVE_REDIRECT_URI, invalid_grant, etc.)
     console.error('❌ Google Drive OAuth callback failed:', err.message);
     console.error(err.stack);
 
@@ -166,6 +170,12 @@ router.get('/status', protect, async (req, res) => {
 });
 
 // @route PATCH /api/drive/settings  { dailyUploadTime?, folderId?, folderName? }
+// NOTE: the frontend (lib/services/api_service.dart -> updateDriveSettings)
+// is responsible for only including folderId/folderName in the request body
+// when it actually intends to change them — see the fix note there. This
+// route's `!== undefined` checks are correct AS LONG AS the client honors
+// that contract, so no change was needed on this side once the client fix
+// landed.
 router.patch('/settings', protect, async (req, res) => {
   try {
     if (!req.user.connectedDrive) {

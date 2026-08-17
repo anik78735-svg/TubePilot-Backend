@@ -56,4 +56,37 @@ router.post('/register-onesignal-player', protect, async (req, res) => {
   res.json({ success: true, message: 'Device registered for OneSignal alerts' });
 });
 
+// Add these two routes to backend/routes/notifications.js if they don't
+// already exist there. Assumes a Notification model with a `user` field
+// referencing the owning user (matches the pattern used by other routes
+// like GET /notifications and PATCH /notifications/:id/read).
+
+// @route DELETE /api/notifications/:id
+// Deletes a single notification belonging to the current user.
+router.delete('/:id', protect, async (req, res) => {
+  try {
+    const notification = await Notification.findOneAndDelete({
+      _id: req.params.id,
+      user: req.user._id, // ensures a user can only delete their own notifications
+    });
+    if (!notification) {
+      return res.status(404).json({ success: false, message: 'Notification not found' });
+    }
+    res.json({ success: true, message: 'Notification deleted' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// @route DELETE /api/notifications
+// Deletes ALL notifications belonging to the current user.
+router.delete('/', protect, async (req, res) => {
+  try {
+    await Notification.deleteMany({ user: req.user._id });
+    res.json({ success: true, message: 'All notifications deleted' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;

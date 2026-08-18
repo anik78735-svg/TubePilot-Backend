@@ -37,11 +37,6 @@ router.get('/oauth/url', protect, (req, res) => {
 });
 
 // @route GET /api/drive/oauth/callback
-// 1st-ever Drive connect for a user is free. Every connect after that
-// (2nd, 3rd, ...) costs DRIVE_RECONNECT_DIAMOND_COST diamonds — charged
-// ONLY after the OAuth exchange succeeds, so cancelling mid-flow never
-// costs anything. If the user doesn't have enough diamonds, we do NOT save
-// the new connectedDrive and redirect back with an insufficient-diamonds error.
 router.get('/oauth/callback', async (req, res) => {
   let platform = 'web';
 
@@ -92,19 +87,10 @@ router.get('/oauth/callback', async (req, res) => {
       user.diamondBalance -= DRIVE_RECONNECT_DIAMOND_COST;
     }
 
-    // ⚠️ FIX: previously this ALWAYS reset folderId/folderName/
-    // lastAutoUploadDate/driveProcessedFileIds/noNewVideoSinceDate to
-    // null/empty on every OAuth callback — including when it was the SAME
-    // Google account reconnecting (e.g. an access-token refresh flow, or
-    // the user tapping "Connect" again after a token expiry). That silently
-    // wiped the user's chosen folder every time this route ran for a
-    // reason unrelated to actually switching accounts — this was the root
-    // cause behind "folder apne aap change ho jaata hai".
-    //
-    // Fix: only wipe folder/upload-progress state when the connecting
-    // account's email is actually DIFFERENT from what was already
-    // connected. Reconnecting the same account now preserves everything
-    // the user already configured.
+    // Only reset folder/upload-progress state when the connecting account
+    // is genuinely DIFFERENT from what was already connected — reconnecting
+    // the SAME account (e.g. a token-refresh style OAuth round-trip) keeps
+    // everything the user already configured, including uploadMode.
     const previousEmail = user.connectedDrive?.email || null;
     const newEmail = accountInfo?.emailAddress || '';
     const isSameAccount = previousEmail && previousEmail === newEmail;
@@ -118,6 +104,7 @@ router.get('/oauth/callback', async (req, res) => {
       folderId: isSameAccount ? (user.connectedDrive?.folderId ?? null) : null,
       folderName: isSameAccount ? (user.connectedDrive?.folderName ?? null) : null,
       dailyUploadTime: user.connectedDrive?.dailyUploadTime || null,
+      uploadMode: isSameAccount ? (user.connectedDrive?.uploadMode || 'scheduled') : 'scheduled',
       lastAutoUploadDate: isSameAccount ? (user.connectedDrive?.lastAutoUploadDate ?? null) : null,
       driveProcessedFileIds: isSameAccount ? (user.connectedDrive?.driveProcessedFileIds || []) : [],
       noNewVideoSinceDate: isSameAccount ? (user.connectedDrive?.noNewVideoSinceDate ?? null) : null,
@@ -146,9 +133,6 @@ router.get('/oauth/callback', async (req, res) => {
 });
 
 // @route DELETE /api/drive/disconnect
-// Note: driveConnectCount is NOT reset here on purpose — it tracks lifetime
-// connects, so a future reconnect after this disconnect still charges
-// (unless this was never actually a paid/free connect yet).
 router.delete('/disconnect', protect, async (req, res) => {
   req.user.connectedDrive = null;
   await req.user.save();
@@ -160,46 +144,72 @@ router.get('/status', protect, async (req, res) => {
   if (!req.user.connectedDrive) {
     return res.status(404).json({ success: false, message: 'No Google Drive connected' });
   }
-  const { email, displayName, folderId, folderName, dailyUploadTime, connectedAt } = req.user.connectedDrive;
+  const { email, displayName, folderId, folderName, dailyUploadTime, uploadMode, connectedAt } = req.user.connectedDrive;
   res.json({
     success: true,
-    drive: { email, displayName, folderId, folderName, dailyUploadTime, connectedAt },
+    drive: { email, displayName, folderId, folderName, dailyUploadTime, uploadMode: uploadMode || 'scheduled', connectedAt },
     driveConnectCount: req.user.driveConnectCount || 0,
     nextConnectDiamondCost: (req.user.driveConnectCount || 0) === 0 ? 0 : DRIVE_RECONNECT_DIAMOND_COST
   });
 });
 
-// @route PATCH /api/drive/settings  { dailyUploadTime?, folderId?, folderName? }
+// @route PATCH /api/drive/settings  { dailyUploadTime?, folderId?, folderName?, uploadMode? }
 // NOTE: the frontend (lib/services/api_service.dart -> updateDriveSettings)
-// is responsible for only including folderId/folderName in the request body
-// when it actually intends to change them — see the fix note there. This
-// route's `!== undefined` checks are correct AS LONG AS the client honors
-// that contract, so no change was needed on this side once the client fix
-// landed.
+// only includes folderId/folderName/uploadMode in the request body when it
+// actually intends to change them — see the fix note there. This route's
+// `!== undefined` checks are correct AS LONG AS the client honors that
+// contract.
 router.patch('/settings', protect, async (req, res) => {
   try {
     if (!req.user.connectedDrive) {
       return res.status(400).json({ success: false, message: 'Please connect Google Drive first' });
     }
-    const { dailyUploadTime, folderId, folderName } = req.body;
+    const { dailyUploadTime, folderId, folderName, uploadMode } = req.body;
+
     if (dailyUploadTime && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(dailyUploadTime)) {
       return res.status(400).json({ success: false, message: 'dailyUploadTime must be in HH:mm (24-hour) format' });
     }
+    if (uploadMode !== undefined && !['scheduled', 'live'].includes(uploadMode)) {
+      return res.status(400).json({ success: false, message: "uploadMode must be 'scheduled' or 'live'" });
+    }
+
     if (dailyUploadTime !== undefined) req.user.connectedDrive.dailyUploadTime = dailyUploadTime;
     if (folderId !== undefined) req.user.connectedDrive.folderId = folderId;
     if (folderName !== undefined) req.user.connectedDrive.folderName = folderName;
+    if (uploadMode !== undefined) req.user.connectedDrive.uploadMode = uploadMode;
     await req.user.save();
 
-    const { email, displayName, folderId: fId, folderName: fName, dailyUploadTime: dt, connectedAt } = req.user.connectedDrive;
-    res.json({ success: true, drive: { email, displayName, folderId: fId, folderName: fName, dailyUploadTime: dt, connectedAt } });
+    console.log(
+      `⚙️ [Drive Settings] User ${req.user._id} updated Drive settings — ` +
+      `dailyUploadTime=${req.user.connectedDrive.dailyUploadTime || '(not set)'}, ` +
+      `folder=${req.user.connectedDrive.folderName || '(whole drive)'}, ` +
+      `uploadMode=${req.user.connectedDrive.uploadMode}`
+    );
+
+    const { email, displayName, folderId: fId, folderName: fName, dailyUploadTime: dt, uploadMode: mode, connectedAt } = req.user.connectedDrive;
+    res.json({ success: true, drive: { email, displayName, folderId: fId, folderName: fName, dailyUploadTime: dt, uploadMode: mode, connectedAt } });
+
+    // ⚡ Instant test trigger: if the user just switched to (or already
+    // was in) Live Upload mode, kick off an immediate background check
+    // right now instead of making them wait up to a minute for the next
+    // cron tick. Fire-and-forget — the response above has already gone
+    // out, this just makes the Render logs light up right away so testing
+    // doesn't require waiting.
+    if (req.user.connectedDrive.uploadMode === 'live') {
+      const { runDriveAutoUploadForUser, getCurrentISTHHMM } = require('../cron/scheduler');
+      const { istDate } = getCurrentISTHHMM();
+      const todayStr = istDate.toISOString().slice(0, 10);
+      console.log(`⚡ [Drive Settings] User ${req.user._id}: Live Upload mode active — firing immediate check (not waiting for next cron tick)...`);
+      runDriveAutoUploadForUser(req.user, todayStr).catch((err) => {
+        console.error(`❌ [Drive Settings] Immediate Live Upload check failed for user ${req.user._id}:`, err.message);
+      });
+    }
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
 // @route GET /api/drive/folders?parentId=xxx
-// Lists sub-folders for the folder picker. Omit parentId to list root-level
-// folders. Used by the "select/change folder" feature.
 router.get('/folders', protect, async (req, res) => {
   try {
     if (!req.user.connectedDrive) {

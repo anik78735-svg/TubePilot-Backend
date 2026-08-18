@@ -21,18 +21,27 @@ const ConnectedDriveSchema = new mongoose.Schema({
   folderId: { type: String, default: null },
   folderName: { type: String, default: null },
   // 'HH:mm' wall-clock time (IST) the user picked in "Daily Upload Time".
-  // This is the time the auto-uploaded video should go PUBLIC. The actual
-  // pull-from-Drive + unlisted-upload always happens at a fixed 06:00 IST
-  // (see backend/cron/scheduler.js) — dailyUploadTime only controls the
-  // later unlisted -> public promotion.
+  // Only meaningful when uploadMode === 'scheduled' — it's the time the
+  // 06:00-uploaded (unlisted) video is promoted to public. Ignored in
+  // 'live' mode, where the video goes public immediately.
   dailyUploadTime: { type: String, default: null },
+  // 'scheduled' (default): fixed 06:00 IST daily pull from Drive, uploads
+  //   unlisted, goes public at dailyUploadTime — normal production flow.
+  // 'live': TESTING mode. The scheduler checks this user EVERY MINUTE
+  //   (not just at 06:00) and uploads any new Drive video immediately,
+  //   straight to public — no unlisted staging, no waiting for a fixed
+  //   time. Meant for verifying the pipeline works without waiting for
+  //   the next real 06:00 IST trigger. Switching to 'live' also fires an
+  //   immediate one-off check right away (see routes/drive.js PATCH
+  //   /settings), instead of waiting for the next minute's cron tick.
+  uploadMode: { type: String, enum: ['scheduled', 'live'], default: 'scheduled' },
   lastAutoUploadDate: { type: String, default: null },
   driveProcessedFileIds: [{ type: String }],
-  // 'YYYY-MM-DD' (IST) of the first day the 06:00 Drive scan found NO new
-  // video to upload. Reset to null as soon as a new video is found again.
-  // If this stays set for >= 2 calendar days in a row, the scheduler
+  // 'YYYY-MM-DD' (IST) of the first day the Drive scan found NO new video
+  // to upload. Reset to null as soon as a new video is found again. If
+  // this stays set for >= 2 calendar days in a row, the scheduler
   // auto-disconnects this user's Drive (see checkDriveInactivityAndDisconnect
-  // in backend/cron/scheduler.js).
+  // in backend/cron/scheduler.js). Only tracked for 'scheduled' mode.
   noNewVideoSinceDate: { type: String, default: null },
   connectedAt: { type: Date, default: Date.now }
 }, { _id: false });

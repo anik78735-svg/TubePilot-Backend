@@ -62,18 +62,30 @@ const ensureFreshYouTubeToken = async (user) => {
 //     metadata patch.
 //   - If there's no scheduledAt, we upload directly with the target privacy.
 //
-// This exact flow is what Drive auto-upload now relies on for Problem 2:
-// runDriveAutoUploadForUser() (below) creates the Video with scheduledAt
-// set to the user's chosen "Daily Upload Time" — so it uploads unlisted at
-// 06:00 IST and this same promoteScheduledYouTubeVideos() tick promotes it
-// to public later, with zero new upload logic needed.
+// Drive auto-upload (Problem 2 / Live-mode) relies on exactly this: a
+// 'scheduled'-mode user's Drive video gets scheduledAt = today's Daily
+// Upload Time -> uploads unlisted at 06:00, goes public later. A
+// 'live'-mode user's Drive video gets scheduledAt = null -> uploads
+// straight to public immediately, for fast testing.
 // -----------------------------------------------------------------------
 const publishToYouTube = async (video, target, user) => {
   const accessToken = await ensureFreshYouTubeToken(user);
-  const fileStream = await getVideoFileStream(video);
 
   const hasFutureSchedule = target.scheduledAt && new Date(target.scheduledAt) > new Date();
   const uploadPrivacy = hasFutureSchedule ? 'unlisted' : (target.privacyStatus || 'public');
+
+  // LOUD, explicit log right before the actual upload starts — this is
+  // the line to watch for in Render logs to confirm a video is really
+  // being pushed to YouTube right now (title, privacy mode, and whether
+  // it's staged for later promotion or going live immediately).
+  console.log(
+    `⬆️ [Scheduler] Video ${video._id}: STARTING YouTube upload — title="${target.title}", uploadPrivacy=${uploadPrivacy}` +
+    (hasFutureSchedule
+      ? `, will auto-promote to "${target.targetPrivacyStatus || 'public'}" at ${new Date(target.scheduledAt).toISOString()} (UTC)`
+      : `, publishing immediately (no staging)`)
+  );
+
+  const fileStream = await getVideoFileStream(video);
 
   const result = await uploadVideoToYouTube({
     accessToken,
@@ -86,6 +98,8 @@ const publishToYouTube = async (video, target, user) => {
     privacyStatus: uploadPrivacy,
     madeForKids: target.audience === 'made_for_kids'
   });
+
+  console.log(`⬆️ [Scheduler] Video ${video._id}: YouTube API upload call finished — videoId=${result.id}`);
 
   target.targetPrivacyStatus = target.targetPrivacyStatus || target.privacyStatus || 'public';
   target.privacyStatus = uploadPrivacy;
@@ -212,11 +226,9 @@ const processVideoTargets = async (video) => {
 // Promotes YouTube targets that were uploaded early as 'unlisted' to their
 // real target privacy (usually 'public') the moment scheduledAt arrives.
 // This does NOT re-upload the video — it's a fast videos.update() patch.
-//
-// For Drive auto-upload (Problem 2), this IS the "second cron job that
-// goes public at the user's set time" — no separate cron needed, this
-// already runs every minute as part of startPublishScheduler and reacts
-// to whatever scheduledAt was stamped on the target when it was created.
+// This is what "goes public at the user's set time" for 'scheduled' mode
+// relies on. 'live' mode never sets scheduledAt, so its videos skip this
+// step entirely and are already public straight from publishToYouTube().
 // -----------------------------------------------------------------------
 const promoteScheduledYouTubeVideos = async () => {
   const now = new Date();
@@ -236,6 +248,8 @@ const promoteScheduledYouTubeVideos = async () => {
     try {
       const user = await User.findById(video.user);
       if (!user || !user.youtubeChannel) continue;
+
+      console.log(`🔓 [Scheduler] Video ${video._id} / youtube: promoting unlisted -> ${target.targetPrivacyStatus || 'public'} now (scheduled time reached)...`);
 
       const accessToken = await ensureFreshYouTubeToken(user);
       await updateVideoPrivacy({
@@ -375,35 +389,40 @@ const daysBetweenDateStrings = (fromStr, toStr) => {
 };
 
 // -----------------------------------------------------------------------
-// Drive auto-upload for one user, fixed to run at 06:00 IST daily.
+// Drive auto-upload for one user.
 //
-// Flow (Problem 2 requirements):
-//   1. Pull the next un-processed video from the user's Drive scope.
-//   2. Upload it to YouTube RIGHT NOW (06:00 IST) as 'unlisted', with
-//      scheduledAt = today's date + the user's chosen "Daily Upload Time".
-//      publishToYouTube() (above) already knows how to do this — it just
-//      needs a Video doc with status 'queued' and a future scheduledAt.
-//   3. The existing promoteScheduledYouTubeVideos() tick (runs every
-//      minute) flips it to public the moment that scheduledAt arrives —
-//      no separate/new cron needed for that half.
-//   4. If there's NO new video in Drive, mark today as a "no video" day.
-//      The first time this happens, notify the user. If it stays empty for
-//      2 IST calendar days in a row, auto-disconnect Drive (see
-//      checkDriveInactivityAndDisconnect below) and notify.
+// Two modes (user.connectedDrive.uploadMode):
+//   'scheduled' (default, production behaviour): only actually RUNS when
+//     called from the fixed 06:00 IST trigger, once per IST day. Pulls the
+//     next un-processed Drive video, uploads it UNLISTED with
+//     scheduledAt = today + dailyUploadTime, and the existing
+//     promoteScheduledYouTubeVideos() tick promotes it to public at that
+//     time — no separate cron needed for that half.
+//   'live' (testing mode): called EVERY MINUTE regardless of time-of-day
+//     or lastAutoUploadDate. Pulls the next un-processed Drive video and
+//     publishes it PUBLIC immediately (scheduledAt = null, no unlisted
+//     staging) — built so you don't have to wait for 06:00 IST to confirm
+//     the pipeline works end-to-end.
+//
+// In both modes: if there's no new video, the "no new video" tracking /
+// notification / 2-day auto-disconnect logic still applies (only really
+// meaningful for 'scheduled' mode in practice, since 'live' mode users are
+// expected to be actively testing, not left running for days).
 // -----------------------------------------------------------------------
 const runDriveAutoUploadForUser = async (user, todayStr) => {
-  console.log(`📁 [Drive Auto-Upload] Running for user ${user._id} (${user.connectedDrive?.email || 'unknown email'}), folderId=${user.connectedDrive?.folderId || '(whole drive)'}`);
+  const mode = user.connectedDrive?.uploadMode === 'live' ? 'LIVE' : 'SCHEDULED';
+  console.log(`📁 [Drive Auto-Upload] [${mode}] Running for user ${user._id} (${user.connectedDrive?.email || 'unknown email'}), folderId=${user.connectedDrive?.folderId || '(whole drive)'}`);
 
   try {
     if (!user.youtubeChannel) {
-      console.warn(`⚠️ [Drive Auto-Upload] User ${user._id} has Drive connected but NO YouTube channel connected — skipping, marking today as done.`);
+      console.warn(`⚠️ [Drive Auto-Upload] [${mode}] User ${user._id} has Drive connected but NO YouTube channel connected — skipping, marking today as done.`);
       user.connectedDrive.lastAutoUploadDate = todayStr;
       await user.save();
       return;
     }
 
     const files = await listUserDriveVideoFiles(user);
-    console.log(`📁 [Drive Auto-Upload] User ${user._id}: found ${files.length} video file(s) in Drive scope. Names: ${files.map((f) => f.name).join(', ') || '(none)'}`);
+    console.log(`📁 [Drive Auto-Upload] [${mode}] User ${user._id}: found ${files.length} video file(s) in Drive scope. Names: ${files.map((f) => f.name).join(', ') || '(none)'}`);
 
     const processedIds = user.connectedDrive.driveProcessedFileIds || [];
     const nextFile = files.find((f) => !processedIds.includes(f.id));
@@ -411,13 +430,10 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
     user.connectedDrive.lastAutoUploadDate = todayStr;
 
     if (!nextFile) {
-      // Nothing new to upload today. Track how long this has been true so
-      // the 2-day auto-disconnect rule and the "video exhausted" notice
-      // (sent once, not every day) can key off it.
       const wasAlreadyEmpty = !!user.connectedDrive.noNewVideoSinceDate;
       if (!wasAlreadyEmpty) {
         user.connectedDrive.noNewVideoSinceDate = todayStr;
-        console.warn(`⚠️ [Drive Auto-Upload] User ${user._id}: Drive has no new video — starting inactivity tracking from ${todayStr}.`);
+        console.warn(`⚠️ [Drive Auto-Upload] [${mode}] User ${user._id}: Drive has no new video — starting inactivity tracking from ${todayStr}.`);
 
         await Notification.create({
           user: user._id,
@@ -436,22 +452,21 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
           data: { type: 'drive_no_new_video' }
         }).catch(() => {});
       } else {
-        console.warn(`⚠️ [Drive Auto-Upload] User ${user._id}: still no new video (empty since ${user.connectedDrive.noNewVideoSinceDate}).`);
+        console.warn(`⚠️ [Drive Auto-Upload] [${mode}] User ${user._id}: still no new video (empty since ${user.connectedDrive.noNewVideoSinceDate}).`);
       }
       await user.save();
       return;
     }
 
-    // Found a video — clear any inactivity tracking from previous empty days.
     user.connectedDrive.noNewVideoSinceDate = null;
 
-    console.log(`📁 [Drive Auto-Upload] User ${user._id}: picked file "${nextFile.name}" (id=${nextFile.id}, mimeType=${nextFile.mimeType}, size=${nextFile.size}) to upload.`);
+    console.log(`📁 [Drive Auto-Upload] [${mode}] User ${user._id}: picked file "${nextFile.name}" (id=${nextFile.id}, mimeType=${nextFile.mimeType}, size=${nextFile.size}) to upload.`);
 
     let charge;
     try {
       charge = chargeForUpload(user);
     } catch (err) {
-      console.warn(`⚠️ [Drive Auto-Upload] User ${user._id}: charge failed — ${err.message}`);
+      console.warn(`⚠️ [Drive Auto-Upload] [${mode}] User ${user._id}: charge failed — ${err.message}`);
       await user.save();
       if (err.code === 'INSUFFICIENT_DIAMONDS') {
         sendOneSignalToUser(user, {
@@ -463,24 +478,30 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
       return;
     }
 
+    console.log(`📁 [Drive Auto-Upload] [${mode}] User ${user._id}: downloading "${nextFile.name}" from Drive...`);
     const buffer = await downloadUserDriveFileBuffer(user, nextFile.id);
-    console.log(`📁 [Drive Auto-Upload] User ${user._id}: downloaded "${nextFile.name}" (${buffer.length} bytes) from Drive, now storing + queueing for YouTube upload...`);
+    console.log(`📁 [Drive Auto-Upload] [${mode}] User ${user._id}: downloaded "${nextFile.name}" (${buffer.length} bytes), now storing + queueing for YouTube upload...`);
 
     const stored = await storeVideoFile(buffer, `${user.userId}_drive_${Date.now()}`, nextFile.mimeType || 'video/mp4');
 
-    // Go-public time: the user's "Daily Upload Time" setting, applied to
-    // TODAY's IST calendar date. If the user hasn't set one, publish
-    // straight away (no unlisted staging step) rather than blocking the
-    // whole flow on a missing setting.
+    // LIVE mode: publish immediately, no unlisted staging — scheduledAt
+    // stays null. SCHEDULED mode: stage unlisted now, go public at the
+    // user's Daily Upload Time (today's IST date + that HH:mm). If no
+    // Daily Upload Time is set yet, fall back to immediate public too,
+    // rather than blocking on a missing setting.
+    const isLiveMode = user.connectedDrive.uploadMode === 'live';
     const dailyTime = user.connectedDrive.dailyUploadTime;
-    const scheduledAt = dailyTime ? buildISTInstant(todayStr, dailyTime) : null;
-    if (scheduledAt) {
-      console.log(`📁 [Drive Auto-Upload] User ${user._id}: video will upload unlisted now and go public at ${scheduledAt.toISOString()} (UTC) = ${dailyTime} IST.`);
+    const scheduledAt = (!isLiveMode && dailyTime) ? buildISTInstant(todayStr, dailyTime) : null;
+
+    if (isLiveMode) {
+      console.log(`📁 [Drive Auto-Upload] [LIVE] User ${user._id}: publishing "${nextFile.name}" IMMEDIATELY as public (test mode — no unlisted staging).`);
+    } else if (scheduledAt) {
+      console.log(`📁 [Drive Auto-Upload] [SCHEDULED] User ${user._id}: video will upload unlisted now and go public at ${scheduledAt.toISOString()} (UTC) = ${dailyTime} IST.`);
     } else {
-      console.log(`📁 [Drive Auto-Upload] User ${user._id}: no Daily Upload Time set — publishing directly as public, no unlisted staging.`);
+      console.log(`📁 [Drive Auto-Upload] [SCHEDULED] User ${user._id}: no Daily Upload Time set — publishing directly as public, no unlisted staging.`);
     }
 
-    await Video.create({
+    const video = await Video.create({
       user: user._id,
       storageProvider: stored.storageProvider,
       storageFileId: stored.storageFileId,
@@ -506,9 +527,9 @@ const runDriveAutoUploadForUser = async (user, todayStr) => {
     user.connectedDrive.driveProcessedFileIds = [...processedIds, nextFile.id];
     await user.save();
 
-    console.log(`✅ [Drive Auto-Upload] User ${user._id}: Video doc created for "${nextFile.name}" with status 'queued' — the publish scheduler will upload it (unlisted, if scheduled) within the next minute, then promote to public at the scheduled time.`);
+    console.log(`✅ [Drive Auto-Upload] [${mode}] User ${user._id}: Video doc ${video._id} created for "${nextFile.name}" (status='queued') — the publish scheduler tick (runs every minute) will pick it up and push it to YouTube within ~1 minute.`);
   } catch (err) {
-    console.error(`❌ [Drive Auto-Upload] FAILED for user ${user._id}:`, err.message);
+    console.error(`❌ [Drive Auto-Upload] [${mode}] FAILED for user ${user._id}:`, err.message);
     console.error(err.stack);
   }
 };
@@ -561,19 +582,32 @@ const startDriveAutoUploadScheduler = () => {
 
       console.log(`📁 [Drive Auto-Upload] Tick — IST time: ${hhmm} on ${todayStr}`);
 
-      // Fixed 06:00 IST trigger for EVERY Drive-connected user, regardless
-      // of their individual "Daily Upload Time" — that setting now only
-      // controls when the video goes public (handled by
-      // promoteScheduledYouTubeVideos in the publish scheduler), not when
-      // it's pulled from Drive and uploaded unlisted.
+      // LIVE mode users: checked EVERY minute, ignoring the once-per-day
+      // gate entirely — built for testing, so a newly added Drive video
+      // (or someone just switching into Live mode) gets picked up within
+      // ~1 minute instead of waiting for 06:00 IST.
+      const liveUsers = await User.find({
+        connectedDrive: { $ne: null },
+        'connectedDrive.uploadMode': 'live'
+      });
+      if (liveUsers.length > 0) {
+        console.log(`📁 [Drive Auto-Upload] [LIVE] Tick: checking ${liveUsers.length} user(s) in Live Upload mode.`);
+        for (const user of liveUsers) {
+          await runDriveAutoUploadForUser(user, todayStr);
+        }
+      }
+
+      // SCHEDULED mode users (default / production): fixed 06:00 IST
+      // trigger, once per IST calendar day (gated by lastAutoUploadDate).
       if (hhmm === '06:00') {
         const dueUsers = await User.find({
           connectedDrive: { $ne: null },
+          'connectedDrive.uploadMode': { $ne: 'live' },
           'connectedDrive.lastAutoUploadDate': { $ne: todayStr }
         });
 
         if (dueUsers.length > 0) {
-          console.log(`📁 [Drive Auto-Upload] 06:00 IST trigger: found ${dueUsers.length} Drive-connected user(s) due for today.`);
+          console.log(`📁 [Drive Auto-Upload] [SCHEDULED] 06:00 IST trigger: found ${dueUsers.length} user(s) due for today.`);
         }
         for (const user of dueUsers) {
           await runDriveAutoUploadForUser(user, todayStr);
@@ -590,12 +624,17 @@ const startDriveAutoUploadScheduler = () => {
       console.error(err.stack);
     }
   });
-  console.log('📁 Drive auto-upload scheduler is running (fixed 06:00 IST pull + unlisted upload, 06:05 inactivity check; go-public time still controlled by promoteScheduledYouTubeVideos)');
+  console.log('📁 Drive auto-upload scheduler is running (LIVE-mode users checked every minute; SCHEDULED-mode users at fixed 06:00 IST + 06:05 inactivity check)');
 };
 
 module.exports = {
   startPublishScheduler,
   startRetryScheduler,
   startFreeUploadReset,
-  startDriveAutoUploadScheduler
+  startDriveAutoUploadScheduler,
+  // Exported so routes/drive.js can trigger an immediate one-off check the
+  // moment a user switches into Live Upload mode, instead of making them
+  // wait up to a minute for the next cron tick.
+  runDriveAutoUploadForUser,
+  getCurrentISTHHMM
 };

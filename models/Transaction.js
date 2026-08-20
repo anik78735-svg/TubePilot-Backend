@@ -13,6 +13,21 @@ const TransactionSchema = new mongoose.Schema({
   diamondsForSpend: { type: Number, default: 0 }, // when type = diamond_spend/refund
   relatedVideo: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', default: null },
 
+  // Cashfree payment gateway fields — the manual UPI/QR + UTR + screenshot
+  // flow has been fully replaced by Cashfree's in-app checkout SDK.
+  paymentMethod: { type: String, enum: ['cashfree'], default: 'cashfree' },
+  // Our own generated order id, sent to Cashfree and used to look up order
+  // status later (verify-payment route, webhook). Indexed since both the
+  // verify route and the webhook look transactions up by this field.
+  cashfreeOrderId: { type: String, default: null, index: true },
+  // Returned by Cashfree when the order is created — passed into the
+  // Flutter SDK to open the checkout screen.
+  paymentSessionId: { type: String, default: null },
+
+  // Legacy fields from the old manual-UPI flow. Kept ONLY so historical
+  // Transaction documents created before the Cashfree migration still read
+  // back correctly (e.g. in the admin payments list) — never written to by
+  // any current route.
   utrNumber: { type: String, default: '' },
   screenshotUrl: { type: String, default: '' },
 

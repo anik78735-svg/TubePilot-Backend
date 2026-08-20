@@ -1,226 +1,202 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
 const { protect } = require('../middleware/auth');
-const {
-  getDriveOAuthClient,
-  exchangeCodeForDriveTokens,
-  getUserDriveAccountInfo,
-  listUserDriveFolders
-} = require('../utils/googleDrive');
-const { sendOneSignalToUser } = require('../utils/oneSignalPush');
+const Transaction = require('../models/Transaction');
 const User = require('../models/User');
+const Notification = require('../models/Notification');
+const { sendPushToUser } = require('../utils/push');
+const { createCashfreeOrder, getCashfreeOrderStatus } = require('../utils/cashfree');
 
 const router = express.Router();
 
-const PRIMARY_FRONTEND_URL = (process.env.FRONTEND_URL || '').split(',')[0].trim();
-const DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly'];
-const DRIVE_RECONNECT_DIAMOND_COST = Number(process.env.DRIVE_RECONNECT_DIAMOND_COST || 30);
+// Fixed packages: 1 Diamond = ₹1, only these 4 sizes are sold
+const DIAMOND_PACKAGES = [10, 50, 100, 200];
 
-console.log(`ℹ️  Google Drive OAuth redirect URI configured as: ${process.env.GOOGLE_DRIVE_REDIRECT_URI || '⚠️ EMPTY — check GOOGLE_DRIVE_REDIRECT_URI in .env'}`);
-console.log(`ℹ️  JWT_SECRET is ${process.env.JWT_SECRET ? 'set (length ' + process.env.JWT_SECRET.length + ')' : '⚠️ EMPTY — check JWT_SECRET in .env'}`);
-
-// @route GET /api/drive/oauth/url?platform=mobile|web
-router.get('/oauth/url', protect, (req, res) => {
-  const oauth2Client = getDriveOAuthClient();
-  const platform = req.query.platform === 'mobile' ? 'mobile' : 'web';
-  const state = jwt.sign({ id: req.user._id, platform }, process.env.JWT_SECRET, { expiresIn: '10m' });
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    prompt: 'consent',
-    scope: DRIVE_SCOPES,
-    state
-  });
-
-  console.log(`🔗 [Drive OAuth] Generated auth URL for user ${req.user._id} (platform=${platform}). state length=${state.length}. Full URL: ${url}`);
-
-  res.json({ success: true, url });
+// @route GET /api/diamonds/packages
+router.get('/packages', protect, (req, res) => {
+  const packages = DIAMOND_PACKAGES.map((d) => ({ diamonds: d, priceINR: d }));
+  res.json({ success: true, packages, currentBalance: req.user.diamondBalance });
 });
 
-// @route GET /api/drive/oauth/callback
-router.get('/oauth/callback', async (req, res) => {
-  let platform = 'web';
-
-  console.log(`🔗 [Drive OAuth] Callback hit. Full query received:`, JSON.stringify(req.query));
-  console.log(`🔗 [Drive OAuth] Raw request URL: ${req.originalUrl}`);
-
+// @route POST /api/diamonds/create-order  { diamondPackage }
+// Creates a pending Transaction + a matching Cashfree order. Returns
+// paymentSessionId, which the Flutter app passes straight into the
+// Cashfree Drop-in checkout SDK to open the in-app payment screen.
+router.post('/create-order', protect, async (req, res) => {
   try {
-    const { code, state } = req.query;
-
-    if (!state) {
-      console.warn('⚠️ [Drive OAuth] Callback hit with no state — ignoring (likely browser retry/prefetch, not a real OAuth redirect).');
-      return res.status(204).end();
+    const diamondPackage = Number(req.body.diamondPackage);
+    if (!DIAMOND_PACKAGES.includes(diamondPackage)) {
+      return res.status(400).json({ success: false, message: 'Invalid diamond package. Choose 10, 50, 100 or 200.' });
     }
 
-    if (!process.env.JWT_SECRET) {
-      console.error('❌ [Drive OAuth] JWT_SECRET env var is empty — cannot verify state.');
-      throw new Error('Server misconfiguration: JWT_SECRET is not set');
+    // Cashfree requires a unique order_id per attempt — include the
+    // timestamp so retrying (e.g. after a cancelled checkout) always works.
+    const orderId = `TP${req.user.userId}_${Date.now()}`;
+
+    const transaction = await Transaction.create({
+      user: req.user._id,
+      userDisplayId: req.user.userId,
+      type: 'diamond_purchase',
+      diamondPackage,
+      amountINR: diamondPackage, // 1 diamond = ₹1
+      status: 'pending',
+      paymentMethod: 'cashfree',
+      cashfreeOrderId: orderId
+    });
+
+    const order = await createCashfreeOrder({
+      orderId,
+      amount: diamondPackage,
+      customerId: req.user.userId,
+      customerPhone: req.user.phone,
+      customerEmail: req.user.email,
+      customerName: req.user.name
+    });
+
+    transaction.paymentSessionId = order.paymentSessionId;
+    await transaction.save();
+
+    console.log(`💳 [Cashfree] Order created — user ${req.user._id}, orderId=${orderId}, amount=₹${diamondPackage}`);
+
+    res.status(201).json({
+      success: true,
+      orderId: order.orderId,
+      paymentSessionId: order.paymentSessionId,
+      transactionId: transaction._id
+    });
+  } catch (err) {
+    if (err.code === 'CASHFREE_NOT_CONFIGURED') {
+      return res.status(503).json({ success: false, message: err.message, code: err.code });
+    }
+    console.error('❌ [Cashfree] create-order failed:', err.response?.data || err.message);
+    res.status(500).json({ success: false, message: 'Could not start payment. Please try again.' });
+  }
+});
+
+// @route POST /api/diamonds/verify-payment  { orderId }
+// Called by the app immediately after the Cashfree checkout screen closes —
+// on BOTH the SDK's success callback and its error/cancel callback, since a
+// failure callback can sometimes fire even when the payment actually went
+// through on Cashfree's side. This NEVER trusts the SDK's client-side
+// result: it always re-fetches the order status directly from Cashfree's
+// server and only credits diamonds if Cashfree itself reports
+// order_status === 'PAID'. Idempotent — safe to call more than once; an
+// already-'approved' transaction is a no-op.
+router.post('/verify-payment', protect, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
+
+    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId, user: req.user._id });
+    if (!transaction) return res.status(404).json({ success: false, message: 'Transaction not found' });
+
+    if (transaction.status === 'approved') {
+      return res.json({ success: true, status: 'approved', message: 'Payment already confirmed', transaction });
     }
 
-    const decoded = jwt.verify(state, process.env.JWT_SECRET);
-    platform = decoded.platform || 'web';
-    console.log(`✅ [Drive OAuth] state verified OK. userId=${decoded.id}, platform=${platform}`);
+    const cfOrder = await getCashfreeOrderStatus(orderId);
+    console.log(`💳 [Cashfree] Verify — order ${orderId}: status=${cfOrder.order_status}`);
 
-    const user = await User.findById(decoded.id);
-    if (!user) throw new Error('User not found');
+    if (cfOrder.order_status === 'PAID') {
+      const user = req.user;
+      user.diamondBalance += transaction.diamondPackage;
+      await user.save();
 
-    const isFirstConnect = (user.driveConnectCount || 0) === 0;
+      transaction.status = 'approved';
+      transaction.reviewedAt = new Date();
+      transaction.adminNote = 'Auto-approved via Cashfree';
+      await transaction.save();
 
-    if (!isFirstConnect) {
-      if (user.diamondBalance < DRIVE_RECONNECT_DIAMOND_COST) {
-        sendOneSignalToUser(user, {
-          title: 'Not enough diamonds 💎',
-          body: `Connecting another Google Drive costs ${DRIVE_RECONNECT_DIAMOND_COST} diamonds. Please buy more diamonds.`,
-          data: { type: 'insufficient_diamonds' }
-        }).catch(() => {});
-        const msg = encodeURIComponent(`You need ${DRIVE_RECONNECT_DIAMOND_COST} diamonds to connect another Drive account.`);
-        if (platform === 'mobile') {
-          return res.redirect(`tubepilot://oauth-success?drive_connected=0&error=${msg}&code=INSUFFICIENT_DIAMONDS`);
-        }
-        return res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?drive_connected=0&error=${msg}`);
+      await Notification.create({
+        user: user._id,
+        type: 'payment_approved',
+        title: 'Payment Successful 🎉',
+        message: `₹${transaction.amountINR} paid — ${transaction.diamondPackage} diamonds added to your wallet.`
+      });
+      await sendPushToUser(user, {
+        title: 'Payment successful 💎',
+        body: `${transaction.diamondPackage} diamonds added to your wallet.`,
+        data: { type: 'payment_approved' }
+      });
+
+      console.log(`✅ [Cashfree] Order ${orderId}: PAID — credited ${transaction.diamondPackage} diamonds to user ${user._id}`);
+      return res.json({ success: true, status: 'approved', message: 'Payment confirmed, diamonds credited', transaction });
+    }
+
+    if (['EXPIRED', 'TERMINATED', 'CANCELLED'].includes(cfOrder.order_status)) {
+      transaction.status = 'rejected';
+      transaction.adminNote = `Cashfree order status: ${cfOrder.order_status}`;
+      await transaction.save();
+      return res.json({ success: true, status: 'rejected', message: 'Payment was not completed', transaction });
+    }
+
+    // 'ACTIVE' or anything else not-yet-final — payment still in progress.
+    return res.json({ success: true, status: 'pending', message: 'Payment not completed yet', transaction });
+  } catch (err) {
+    console.error('❌ [Cashfree] verify-payment failed:', err.response?.data || err.message);
+    res.status(500).json({ success: false, message: 'Could not verify payment. Please check My Requests or contact support.' });
+  }
+});
+
+// @route POST /api/diamonds/webhook  (Cashfree server-to-server webhook)
+// Backup confirmation path for when the app is closed/killed before it can
+// call verify-payment itself — configure this URL in the Cashfree
+// dashboard under Developers -> Webhooks. No auth middleware (Cashfree
+// can't send a user JWT); instead of trusting the webhook body's
+// amount/status directly, this re-fetches the order from Cashfree's API
+// using the order_id in the payload — same server-side-source-of-truth
+// pattern as verify-payment above. Always responds 200 so Cashfree doesn't
+// retry-storm on a transient error on our end.
+router.post('/webhook', async (req, res) => {
+  try {
+    const orderId = req.body?.data?.order?.order_id;
+    if (!orderId) return res.status(200).json({ success: true });
+
+    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId });
+    if (!transaction || transaction.status === 'approved') {
+      return res.status(200).json({ success: true });
+    }
+
+    const cfOrder = await getCashfreeOrderStatus(orderId);
+    console.log(`💳 [Cashfree Webhook] Order ${orderId}: status=${cfOrder.order_status}`);
+
+    if (cfOrder.order_status === 'PAID') {
+      const user = await User.findById(transaction.user);
+      if (user) {
+        user.diamondBalance += transaction.diamondPackage;
+        await user.save();
+
+        transaction.status = 'approved';
+        transaction.reviewedAt = new Date();
+        transaction.adminNote = 'Auto-approved via Cashfree webhook';
+        await transaction.save();
+
+        await Notification.create({
+          user: user._id,
+          type: 'payment_approved',
+          title: 'Payment Successful 🎉',
+          message: `₹${transaction.amountINR} paid — ${transaction.diamondPackage} diamonds added to your wallet.`
+        });
+        await sendPushToUser(user, {
+          title: 'Payment successful 💎',
+          body: `${transaction.diamondPackage} diamonds added to your wallet.`,
+          data: { type: 'payment_approved' }
+        });
+
+        console.log(`✅ [Cashfree Webhook] Order ${orderId}: PAID — credited ${transaction.diamondPackage} diamonds to user ${user._id}`);
       }
     }
 
-    const tokens = await exchangeCodeForDriveTokens(code);
-    const accountInfo = await getUserDriveAccountInfo(tokens.access_token);
-
-    if (!isFirstConnect) {
-      user.diamondBalance -= DRIVE_RECONNECT_DIAMOND_COST;
-    }
-
-    // Only reset folder/upload-progress state when the connecting account
-    // is genuinely DIFFERENT from what was already connected — reconnecting
-    // the SAME account (e.g. a token-refresh style OAuth round-trip) keeps
-    // everything the user already configured, including uploadMode.
-    const previousEmail = user.connectedDrive?.email || null;
-    const newEmail = accountInfo?.emailAddress || '';
-    const isSameAccount = previousEmail && previousEmail === newEmail;
-
-    user.connectedDrive = {
-      email: newEmail,
-      displayName: accountInfo?.displayName || '',
-      accessToken: tokens.access_token,
-      refreshToken: tokens.refresh_token || user.connectedDrive?.refreshToken,
-      tokenExpiryDate: tokens.expiry_date,
-      folderId: isSameAccount ? (user.connectedDrive?.folderId ?? null) : null,
-      folderName: isSameAccount ? (user.connectedDrive?.folderName ?? null) : null,
-      dailyUploadTime: user.connectedDrive?.dailyUploadTime || null,
-      uploadMode: isSameAccount ? (user.connectedDrive?.uploadMode || 'scheduled') : 'scheduled',
-      lastAutoUploadDate: isSameAccount ? (user.connectedDrive?.lastAutoUploadDate ?? null) : null,
-      driveProcessedFileIds: isSameAccount ? (user.connectedDrive?.driveProcessedFileIds || []) : [],
-      noNewVideoSinceDate: isSameAccount ? (user.connectedDrive?.noNewVideoSinceDate ?? null) : null,
-      connectedAt: new Date()
-    };
-    user.driveConnectCount = (user.driveConnectCount || 0) + 1;
-    await user.save();
-
-    console.log(`✅ [Drive OAuth] Drive connected successfully for user ${user._id} (${newEmail || 'unknown email'}). sameAccountReconnect=${isSameAccount}`);
-
-    if (platform === 'mobile') {
-      res.redirect('tubepilot://oauth-success?drive_connected=1');
-    } else {
-      res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?drive_connected=1`);
-    }
+    res.status(200).json({ success: true });
   } catch (err) {
-    console.error('❌ Google Drive OAuth callback failed:', err.message);
-    console.error(err.stack);
-
-    if (platform === 'mobile') {
-      res.redirect(`tubepilot://oauth-success?drive_connected=0&error=${encodeURIComponent(err.message)}`);
-    } else {
-      res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?drive_connected=0&error=${encodeURIComponent(err.message)}`);
-    }
+    console.error('❌ [Cashfree Webhook] error:', err.response?.data || err.message);
+    res.status(200).json({ success: true });
   }
 });
 
-// @route DELETE /api/drive/disconnect
-router.delete('/disconnect', protect, async (req, res) => {
-  req.user.connectedDrive = null;
-  await req.user.save();
-  res.json({ success: true, message: 'Google Drive disconnected' });
-});
-
-// @route GET /api/drive/status
-router.get('/status', protect, async (req, res) => {
-  if (!req.user.connectedDrive) {
-    return res.status(404).json({ success: false, message: 'No Google Drive connected' });
-  }
-  const { email, displayName, folderId, folderName, dailyUploadTime, uploadMode, connectedAt } = req.user.connectedDrive;
-  res.json({
-    success: true,
-    drive: { email, displayName, folderId, folderName, dailyUploadTime, uploadMode: uploadMode || 'scheduled', connectedAt },
-    driveConnectCount: req.user.driveConnectCount || 0,
-    nextConnectDiamondCost: (req.user.driveConnectCount || 0) === 0 ? 0 : DRIVE_RECONNECT_DIAMOND_COST
-  });
-});
-
-// @route PATCH /api/drive/settings  { dailyUploadTime?, folderId?, folderName?, uploadMode? }
-// NOTE: the frontend (lib/services/api_service.dart -> updateDriveSettings)
-// only includes folderId/folderName/uploadMode in the request body when it
-// actually intends to change them — see the fix note there. This route's
-// `!== undefined` checks are correct AS LONG AS the client honors that
-// contract.
-router.patch('/settings', protect, async (req, res) => {
-  try {
-    if (!req.user.connectedDrive) {
-      return res.status(400).json({ success: false, message: 'Please connect Google Drive first' });
-    }
-    const { dailyUploadTime, folderId, folderName, uploadMode } = req.body;
-
-    if (dailyUploadTime && !/^([01]\d|2[0-3]):([0-5]\d)$/.test(dailyUploadTime)) {
-      return res.status(400).json({ success: false, message: 'dailyUploadTime must be in HH:mm (24-hour) format' });
-    }
-    if (uploadMode !== undefined && !['scheduled', 'live'].includes(uploadMode)) {
-      return res.status(400).json({ success: false, message: "uploadMode must be 'scheduled' or 'live'" });
-    }
-
-    if (dailyUploadTime !== undefined) req.user.connectedDrive.dailyUploadTime = dailyUploadTime;
-    if (folderId !== undefined) req.user.connectedDrive.folderId = folderId;
-    if (folderName !== undefined) req.user.connectedDrive.folderName = folderName;
-    if (uploadMode !== undefined) req.user.connectedDrive.uploadMode = uploadMode;
-    await req.user.save();
-
-    console.log(
-      `⚙️ [Drive Settings] User ${req.user._id} updated Drive settings — ` +
-      `dailyUploadTime=${req.user.connectedDrive.dailyUploadTime || '(not set)'}, ` +
-      `folder=${req.user.connectedDrive.folderName || '(whole drive)'}, ` +
-      `uploadMode=${req.user.connectedDrive.uploadMode}`
-    );
-
-    const { email, displayName, folderId: fId, folderName: fName, dailyUploadTime: dt, uploadMode: mode, connectedAt } = req.user.connectedDrive;
-    res.json({ success: true, drive: { email, displayName, folderId: fId, folderName: fName, dailyUploadTime: dt, uploadMode: mode, connectedAt } });
-
-    // ⚡ Instant test trigger: if the user just switched to (or already
-    // was in) Live Upload mode, kick off an immediate background check
-    // right now instead of making them wait up to a minute for the next
-    // cron tick. Fire-and-forget — the response above has already gone
-    // out, this just makes the Render logs light up right away so testing
-    // doesn't require waiting.
-    if (req.user.connectedDrive.uploadMode === 'live') {
-      const { runDriveAutoUploadForUser, getCurrentISTHHMM } = require('../cron/scheduler');
-      const { istDate } = getCurrentISTHHMM();
-      const todayStr = istDate.toISOString().slice(0, 10);
-      console.log(`⚡ [Drive Settings] User ${req.user._id}: Live Upload mode active — firing immediate check (not waiting for next cron tick)...`);
-      runDriveAutoUploadForUser(req.user, todayStr).catch((err) => {
-        console.error(`❌ [Drive Settings] Immediate Live Upload check failed for user ${req.user._id}:`, err.message);
-      });
-    }
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// @route GET /api/drive/folders?parentId=xxx
-router.get('/folders', protect, async (req, res) => {
-  try {
-    if (!req.user.connectedDrive) {
-      return res.status(400).json({ success: false, message: 'Please connect Google Drive first' });
-    }
-    const parentId = req.query.parentId || undefined;
-    const folders = await listUserDriveFolders(req.user, parentId);
-    res.json({ success: true, folders });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
+// @route GET /api/diamonds/my-requests
+router.get('/my-requests', protect, async (req, res) => {
+  const transactions = await Transaction.find({ user: req.user._id, type: 'diamond_purchase' }).sort({ createdAt: -1 });
+  res.json({ success: true, transactions });
 });
 
 module.exports = router;

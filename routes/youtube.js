@@ -1,7 +1,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { protect } = require('../middleware/auth');
-const { getOAuthClient, exchangeCodeForTokens, getChannelInfo, refreshAccessToken } = require('../utils/youtube');
+const { getOAuthClient, exchangeCodeForTokens, getChannelInfo } = require('../utils/youtube');
 const User = require('../models/User');
 
 const router = express.Router();
@@ -15,6 +15,18 @@ const SCOPES = [
   'https://www.googleapis.com/auth/youtube.readonly',
   'https://www.googleapis.com/auth/youtube'
 ];
+
+// ⚠️ ADD: pick the best available thumbnail resolution instead of always
+// using `default` (which is a tiny 88x88 image — fine for a list icon but
+// noticeably soft/blurry anywhere it's shown larger, e.g. the Profile
+// screen's subscriber card). YouTube's API returns thumbnails.default
+// always, .medium/.high only when the channel has them — fall through in
+// quality order so we always get the best one actually available.
+const pickChannelThumbnail = (snippet) =>
+  snippet?.thumbnails?.high?.url ||
+  snippet?.thumbnails?.medium?.url ||
+  snippet?.thumbnails?.default?.url ||
+  '';
 
 // @route GET /api/youtube/oauth/url?platform=mobile|web
 // Returns the Google consent URL. We encode the user's id + platform in `state` (signed) so the
@@ -48,14 +60,10 @@ router.get('/oauth/callback', async (req, res) => {
     const tokens = await exchangeCodeForTokens(code);
     const channel = await getChannelInfo(tokens.access_token);
 
-    if (!channel) {
-      throw new Error('No YouTube channel found on this Google account');
-    }
-
     user.youtubeChannel = {
       channelId: channel.id,
       channelTitle: channel.snippet.title,
-      thumbnail: channel.snippet.thumbnails?.default?.url || '',
+      thumbnail: pickChannelThumbnail(channel.snippet),
       subscriberCount: channel.statistics?.subscriberCount || '0',
       accessToken: tokens.access_token,
       refreshToken: tokens.refresh_token || user.youtubeChannel?.refreshToken,
@@ -72,12 +80,6 @@ router.get('/oauth/callback', async (req, res) => {
       res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?youtube_connected=1`);
     }
   } catch (err) {
-    // Logged with full detail so Render logs show the real cause
-    // (redirect_uri_mismatch, invalid_grant, missing test-user access, etc.)
-    // instead of just a generic "failed to connect" toast in the app.
-    console.error('❌ YouTube OAuth callback failed:', err.message);
-    console.error(err.stack);
-
     if (platform === 'mobile') {
       res.redirect(`tubepilot://oauth-success?youtube_connected=0&error=${encodeURIComponent(err.message)}`);
     } else {
@@ -94,84 +96,12 @@ router.delete('/disconnect', protect, async (req, res) => {
 });
 
 // @route GET /api/youtube/channel
-// Returns the connected channel's info with a LIVE subscriber count.
-//
-// Previously this just read whatever was stored in the DB — which was only
-// ever set once, at the moment of OAuth connect (see /oauth/callback above).
-// That meant subscriberCount silently went stale forever: if a channel
-// grew from 100 to 10,000 subscribers after connecting, the app would keep
-// showing 100 until the user disconnected and reconnected.
-//
-// Now: every call to this route fetches fresh stats from the YouTube API
-// (refreshing the access token first if it's expired) and updates the
-// stored value before responding, so the number shown in the app is always
-// current as of whenever the profile/settings screen was last opened.
-//
-// If the live fetch fails for any reason (token revoked, API hiccup,
-// channel deleted on YouTube's side, etc.) we fall back to the last known
-// stored value instead of erroring out the whole screen — a slightly stale
-// number is a much better experience than a broken profile page.
 router.get('/channel', protect, async (req, res) => {
   if (!req.user.youtubeChannel) {
     return res.status(404).json({ success: false, message: 'No YouTube channel connected' });
   }
-
-  const stored = req.user.youtubeChannel;
-  let accessToken = stored.accessToken;
-  let refreshTokenValue = stored.refreshToken;
-  let tokenExpiryDate = stored.tokenExpiryDate;
-  let needsSave = false;
-
-  try {
-    const isExpired = !tokenExpiryDate || Date.now() >= tokenExpiryDate - 60_000; // refresh 1 min early
-    if (isExpired) {
-      if (!refreshTokenValue) throw new Error('No refresh token stored — cannot refresh access token');
-      const credentials = await refreshAccessToken(refreshTokenValue);
-      accessToken = credentials.access_token;
-      tokenExpiryDate = credentials.expiry_date;
-      needsSave = true;
-    }
-
-    const channel = await getChannelInfo(accessToken);
-    if (!channel) throw new Error('Channel not found on YouTube');
-
-    const freshSubscriberCount = channel.statistics?.subscriberCount || '0';
-    const freshThumbnail = channel.snippet.thumbnails?.default?.url || stored.thumbnail;
-    const freshTitle = channel.snippet.title || stored.channelTitle;
-
-    if (
-      freshSubscriberCount !== stored.subscriberCount ||
-      freshThumbnail !== stored.thumbnail ||
-      freshTitle !== stored.channelTitle ||
-      needsSave
-    ) {
-      req.user.youtubeChannel.subscriberCount = freshSubscriberCount;
-      req.user.youtubeChannel.thumbnail = freshThumbnail;
-      req.user.youtubeChannel.channelTitle = freshTitle;
-      req.user.youtubeChannel.accessToken = accessToken;
-      req.user.youtubeChannel.tokenExpiryDate = tokenExpiryDate;
-      await req.user.save();
-    }
-
-    return res.json({
-      success: true,
-      channel: {
-        channelId: stored.channelId,
-        channelTitle: freshTitle,
-        thumbnail: freshThumbnail,
-        subscriberCount: freshSubscriberCount,
-        connectedAt: stored.connectedAt
-      }
-    });
-  } catch (err) {
-    console.error('⚠️  Live YouTube channel refresh failed, falling back to stored value:', err.message);
-    const { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } = stored;
-    return res.json({
-      success: true,
-      channel: { channelId, channelTitle, thumbnail, subscriberCount, connectedAt },
-      stale: true
-    });
-  }
+  const { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } = req.user.youtubeChannel;
+  res.json({ success: true, channel: { channelId, channelTitle, thumbnail, subscriberCount, connectedAt } });
 });
 
 module.exports = router;

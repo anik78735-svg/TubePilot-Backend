@@ -1,202 +1,178 @@
 const express = require('express');
+const axios = require('axios');
 const { protect } = require('../middleware/auth');
 const Transaction = require('../models/Transaction');
 const User = require('../models/User');
-const Notification = require('../models/Notification');
-const { sendPushToUser } = require('../utils/push');
-const { createCashfreeOrder, getCashfreeOrderStatus } = require('../utils/cashfree');
 
 const router = express.Router();
 
-// Fixed packages: 1 Diamond = ₹1, only these 4 sizes are sold
-const DIAMOND_PACKAGES = [10, 50, 100, 200];
+// Helper to sanitize phone for Cashfree requirements
+const formatPhoneNumber = (phoneStr) => {
+  if (!phoneStr) return '9999999999';
+  const cleaned = phoneStr.replace(/\D/g, '');
+  if (cleaned.length >= 10) {
+    return cleaned.slice(-10);
+  }
+  return '9999999999';
+};
 
-// @route GET /api/diamonds/packages
-router.get('/packages', protect, (req, res) => {
-  const packages = DIAMOND_PACKAGES.map((d) => ({ diamonds: d, priceINR: d }));
-  res.json({ success: true, packages, currentBalance: req.user.diamondBalance });
-});
-
-// @route POST /api/diamonds/create-order  { diamondPackage }
-// Creates a pending Transaction + a matching Cashfree order. Returns
-// paymentSessionId, which the Flutter app passes straight into the
-// Cashfree Drop-in checkout SDK to open the in-app payment screen.
+// @route   POST /api/diamonds/create-order
+// @desc    Creates Cashfree Payment Order for Diamond Purchase
 router.post('/create-order', protect, async (req, res) => {
   try {
-    const diamondPackage = Number(req.body.diamondPackage);
-    if (!DIAMOND_PACKAGES.includes(diamondPackage)) {
-      return res.status(400).json({ success: false, message: 'Invalid diamond package. Choose 10, 50, 100 or 200.' });
+    const { diamondPackage } = req.body; // Package options: 10, 50, 100, 200
+
+    const validPackages = [10, 50, 100, 200];
+    const pkgAmount = Number(diamondPackage);
+
+    if (!validPackages.includes(pkgAmount)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid diamond package selection. Choose 10, 50, 100, or 200.'
+      });
     }
 
-    // Cashfree requires a unique order_id per attempt — include the
-    // timestamp so retrying (e.g. after a cancelled checkout) always works.
-    const orderId = `TP${req.user.userId}_${Date.now()}`;
+    const orderId = `ORDER_${Date.now()}_${req.user._id.toString().slice(-4)}`;
+    const amountINR = pkgAmount; // 1 Diamond = ₹1 Rate
 
+    const isProduction = process.env.CASHFREE_ENV === 'PRODUCTION';
+    const cashfreeBaseUrl = isProduction
+      ? 'https://api.cashfree.com/pg/orders'
+      : 'https://sandbox.cashfree.com/pg/orders';
+
+    const customerPhone = formatPhoneNumber(req.user.phone);
+    const customerEmail = (req.user.email && req.user.email.includes('@')) 
+      ? req.user.email 
+      : `user_${req.user._id}@tubepilot.app`;
+
+    const requestBody = {
+      order_id: orderId,
+      order_amount: amountINR,
+      order_currency: 'INR',
+      customer_details: {
+        customer_id: req.user._id.toString(),
+        customer_email: customerEmail,
+        customer_phone: customerPhone,
+        customer_name: req.user.name || 'TubePilot User'
+      },
+      order_meta: {
+        return_url: `https://test.cashfree.com/pgapp/subsc/dev/return?order_id=${orderId}`
+      }
+    };
+
+    const response = await axios.post(cashfreeBaseUrl, requestBody, {
+      headers: {
+        'x-client-id': process.env.CASHFREE_APP_ID,
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY,
+        'x-api-version': '2023-08-01',
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const { payment_session_id } = response.data;
+
+    // Create pending transaction entry
     const transaction = await Transaction.create({
       user: req.user._id,
-      userDisplayId: req.user.userId,
+      userDisplayId: `TP${Math.floor(100000 + Math.random() * 900000)}`,
       type: 'diamond_purchase',
-      diamondPackage,
-      amountINR: diamondPackage, // 1 diamond = ₹1
-      status: 'pending',
+      diamondPackage: pkgAmount,
+      amountINR: amountINR,
       paymentMethod: 'cashfree',
-      cashfreeOrderId: orderId
+      cashfreeOrderId: orderId,
+      paymentSessionId: payment_session_id,
+      status: 'pending'
     });
 
-    const order = await createCashfreeOrder({
-      orderId,
-      amount: diamondPackage,
-      customerId: req.user.userId,
-      customerPhone: req.user.phone,
-      customerEmail: req.user.email,
-      customerName: req.user.name
-    });
-
-    transaction.paymentSessionId = order.paymentSessionId;
-    await transaction.save();
-
-    console.log(`💳 [Cashfree] Order created — user ${req.user._id}, orderId=${orderId}, amount=₹${diamondPackage}`);
-
-    res.status(201).json({
+    res.status(200).json({
       success: true,
-      orderId: order.orderId,
-      paymentSessionId: order.paymentSessionId,
+      paymentSessionId: payment_session_id,
+      orderId: orderId,
+      environment: isProduction ? 'PRODUCTION' : 'SANDBOX',
       transactionId: transaction._id
     });
+
   } catch (err) {
-    if (err.code === 'CASHFREE_NOT_CONFIGURED') {
-      return res.status(503).json({ success: false, message: err.message, code: err.code });
-    }
-    console.error('❌ [Cashfree] create-order failed:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: 'Could not start payment. Please try again.' });
+    console.error('❌ [Cashfree Order Error]:', err.response?.data || err.message);
+    res.status(500).json({
+      success: false,
+      message: err.response?.data?.message || 'Failed to initialize Cashfree payment order.'
+    });
   }
 });
 
-// @route POST /api/diamonds/verify-payment  { orderId }
-// Called by the app immediately after the Cashfree checkout screen closes —
-// on BOTH the SDK's success callback and its error/cancel callback, since a
-// failure callback can sometimes fire even when the payment actually went
-// through on Cashfree's side. This NEVER trusts the SDK's client-side
-// result: it always re-fetches the order status directly from Cashfree's
-// server and only credits diamonds if Cashfree itself reports
-// order_status === 'PAID'. Idempotent — safe to call more than once; an
-// already-'approved' transaction is a no-op.
+// @route   POST /api/diamonds/verify-payment
+// @desc    Verifies payment with Cashfree after SDK callback & credits diamonds
 router.post('/verify-payment', protect, async (req, res) => {
   try {
     const { orderId } = req.body;
-    if (!orderId) return res.status(400).json({ success: false, message: 'orderId is required' });
 
-    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId, user: req.user._id });
-    if (!transaction) return res.status(404).json({ success: false, message: 'Transaction not found' });
-
-    if (transaction.status === 'approved') {
-      return res.json({ success: true, status: 'approved', message: 'Payment already confirmed', transaction });
+    if (!orderId) {
+      return res.status(400).json({ success: false, message: 'orderId is required.' });
     }
 
-    const cfOrder = await getCashfreeOrderStatus(orderId);
-    console.log(`💳 [Cashfree] Verify — order ${orderId}: status=${cfOrder.order_status}`);
+    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId, user: req.user._id });
 
-    if (cfOrder.order_status === 'PAID') {
-      const user = req.user;
+    if (!transaction) {
+      return res.status(404).json({ success: false, message: 'Transaction record not found.' });
+    }
+
+    if (transaction.status === 'approved' || transaction.status === 'completed') {
+      const updatedUser = await User.findById(req.user._id);
+      return res.json({
+        success: true,
+        message: 'Payment already processed.',
+        diamondBalance: updatedUser.diamondBalance
+      });
+    }
+
+    const isProduction = process.env.CASHFREE_ENV === 'PRODUCTION';
+    const verifyUrl = isProduction
+      ? `https://api.cashfree.com/pg/orders/${orderId}`
+      : `https://sandbox.cashfree.com/pg/orders/${orderId}`;
+
+    const response = await axios.get(verifyUrl, {
+      headers: {
+        'x-client-id': process.env.CASHFREE_APP_ID,
+        'x-client-secret': process.env.CASHFREE_SECRET_KEY,
+        'x-api-version': '2023-08-01'
+      }
+    });
+
+    const orderData = response.data;
+
+    if (orderData.order_status === 'PAID') {
+      transaction.status = 'approved';
+      transaction.reviewedAt = new Date();
+      await transaction.save();
+
+      // Add purchased diamonds to user account
+      const user = await User.findById(req.user._id);
       user.diamondBalance += transaction.diamondPackage;
       await user.save();
 
-      transaction.status = 'approved';
-      transaction.reviewedAt = new Date();
-      transaction.adminNote = 'Auto-approved via Cashfree';
-      await transaction.save();
-
-      await Notification.create({
-        user: user._id,
-        type: 'payment_approved',
-        title: 'Payment Successful 🎉',
-        message: `₹${transaction.amountINR} paid — ${transaction.diamondPackage} diamonds added to your wallet.`
+      return res.json({
+        success: true,
+        message: 'Payment verified successfully! Diamonds added.',
+        diamondBalance: user.diamondBalance
       });
-      await sendPushToUser(user, {
-        title: 'Payment successful 💎',
-        body: `${transaction.diamondPackage} diamonds added to your wallet.`,
-        data: { type: 'payment_approved' }
-      });
-
-      console.log(`✅ [Cashfree] Order ${orderId}: PAID — credited ${transaction.diamondPackage} diamonds to user ${user._id}`);
-      return res.json({ success: true, status: 'approved', message: 'Payment confirmed, diamonds credited', transaction });
-    }
-
-    if (['EXPIRED', 'TERMINATED', 'CANCELLED'].includes(cfOrder.order_status)) {
+    } else {
       transaction.status = 'rejected';
-      transaction.adminNote = `Cashfree order status: ${cfOrder.order_status}`;
       await transaction.save();
-      return res.json({ success: true, status: 'rejected', message: 'Payment was not completed', transaction });
+
+      return res.status(400).json({
+        success: false,
+        message: `Payment status is ${orderData.order_status}.`
+      });
     }
 
-    // 'ACTIVE' or anything else not-yet-final — payment still in progress.
-    return res.json({ success: true, status: 'pending', message: 'Payment not completed yet', transaction });
   } catch (err) {
-    console.error('❌ [Cashfree] verify-payment failed:', err.response?.data || err.message);
-    res.status(500).json({ success: false, message: 'Could not verify payment. Please check My Requests or contact support.' });
+    console.error('❌ [Verify Payment Error]:', err.response?.data || err.message);
+    res.status(500).json({
+      success: false,
+      message: err.response?.data?.message || 'Payment verification failed.'
+    });
   }
-});
-
-// @route POST /api/diamonds/webhook  (Cashfree server-to-server webhook)
-// Backup confirmation path for when the app is closed/killed before it can
-// call verify-payment itself — configure this URL in the Cashfree
-// dashboard under Developers -> Webhooks. No auth middleware (Cashfree
-// can't send a user JWT); instead of trusting the webhook body's
-// amount/status directly, this re-fetches the order from Cashfree's API
-// using the order_id in the payload — same server-side-source-of-truth
-// pattern as verify-payment above. Always responds 200 so Cashfree doesn't
-// retry-storm on a transient error on our end.
-router.post('/webhook', async (req, res) => {
-  try {
-    const orderId = req.body?.data?.order?.order_id;
-    if (!orderId) return res.status(200).json({ success: true });
-
-    const transaction = await Transaction.findOne({ cashfreeOrderId: orderId });
-    if (!transaction || transaction.status === 'approved') {
-      return res.status(200).json({ success: true });
-    }
-
-    const cfOrder = await getCashfreeOrderStatus(orderId);
-    console.log(`💳 [Cashfree Webhook] Order ${orderId}: status=${cfOrder.order_status}`);
-
-    if (cfOrder.order_status === 'PAID') {
-      const user = await User.findById(transaction.user);
-      if (user) {
-        user.diamondBalance += transaction.diamondPackage;
-        await user.save();
-
-        transaction.status = 'approved';
-        transaction.reviewedAt = new Date();
-        transaction.adminNote = 'Auto-approved via Cashfree webhook';
-        await transaction.save();
-
-        await Notification.create({
-          user: user._id,
-          type: 'payment_approved',
-          title: 'Payment Successful 🎉',
-          message: `₹${transaction.amountINR} paid — ${transaction.diamondPackage} diamonds added to your wallet.`
-        });
-        await sendPushToUser(user, {
-          title: 'Payment successful 💎',
-          body: `${transaction.diamondPackage} diamonds added to your wallet.`,
-          data: { type: 'payment_approved' }
-        });
-
-        console.log(`✅ [Cashfree Webhook] Order ${orderId}: PAID — credited ${transaction.diamondPackage} diamonds to user ${user._id}`);
-      }
-    }
-
-    res.status(200).json({ success: true });
-  } catch (err) {
-    console.error('❌ [Cashfree Webhook] error:', err.response?.data || err.message);
-    res.status(200).json({ success: true });
-  }
-});
-
-// @route GET /api/diamonds/my-requests
-router.get('/my-requests', protect, async (req, res) => {
-  const transactions = await Transaction.find({ user: req.user._id, type: 'diamond_purchase' }).sort({ createdAt: -1 });
-  res.json({ success: true, transactions });
 });
 
 module.exports = router;

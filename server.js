@@ -28,17 +28,16 @@ const notificationRoutes = require('./routes/notifications');
 const analyticsRoutes = require('./routes/analytics');
 const ratingsRoutes = require('./routes/ratings');
 const seedAdminRoute = require('./routes/seedAdmin');
-const postsRoutes = require('./routes/posts');
 
 const app = express();
 
-// Enable reverse proxy trust for hosts like Render, Heroku, Railway
+// Enable reverse proxy trust
 app.set('trust proxy', 1);
 
 // Security Headers
 app.use(helmet());
 
-// Dynamic CORS Configuration
+// Dynamic CORS Setup
 const allowedOrigins = (process.env.FRONTEND_URL || '')
   .split(',')
   .map((o) => o.trim())
@@ -55,7 +54,6 @@ app.use(cors({
   credentials: true
 }));
 
-// Body Parsing & Cookie Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
@@ -72,35 +70,33 @@ app.use('/api/', globalLimiter);
 const authLimiter = rateLimit({ 
   windowMs: 15 * 60 * 1000, 
   max: 20,
-  message: { success: false, message: 'Too many authentication attempts, please try again later.' }
+  message: { success: false, message: 'Too many auth requests' }
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
 
-// --- API Route Mappings with Fallback Aliases ---
+// --- API Route Mappings (With Plural/Singular Fallback Endpoints) ---
 
-// Core & Authentication
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/youtube', youtubeRoutes);
 app.use('/api/drive', driveRoutes);
-app.use('/api/posts', postsRoutes);
 
-// Meta / Facebook Routes (Supports /meta, /facebook, and /meta/facebook)
+// Meta & Facebook Aliases (Fixes 404 Route Not Found on Meta)
 app.use('/api/meta', metaRoutes);
 app.use('/api/facebook', metaRoutes);
 app.use('/api/meta/facebook', metaRoutes);
 
-// Video Routes (Supports both plural and singular)
+// Video Routes
 app.use('/api/videos', videoRoutes);
 app.use('/api/video', videoRoutes);
 
-// Diamond & Payment Routes (Supports plural, singular, and payment)
+// Diamond & Payment Routes
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
 
-// Analytics, Admin, Wallet & Utilities
+// General & Admin Routes
 app.use('/api/wallet', walletRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/ai', aiRoutes);
@@ -109,19 +105,23 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/seed-admin', seedAdminRoute);
 
-// Health Check Endpoint
+if (require('fs').existsSync('./routes/posts.js')) {
+  app.use('/api/posts', require('./routes/posts'));
+}
+
+// Health Check
 app.get('/api/health', (req, res) => res.json({ 
   success: true, 
   message: 'TubePilot API is running',
   timestamp: new Date().toISOString()
 }));
 
-// Catch-all 404 for API endpoints
+// Fallback 404 for unmatched API requests
 app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
 
-// Centralized Global Error Handler
+// Global Error Handling
 app.use((err, req, res, next) => {
-  console.error('❌ [Global Server Error]:', err.stack || err.message);
+  console.error('❌ [Server Error]:', err.stack || err.message);
   
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ success: false, message: 'CORS policy blocked this request' });
@@ -146,7 +146,7 @@ const start = async () => {
       startDriveAutoUploadScheduler();
     });
   } catch (error) {
-    console.error('❌ Failed to start server:', error.message);
+    console.error('❌ Server startup error:', error.message);
     process.exit(1);
   }
 };

@@ -7,6 +7,84 @@ const META_APP_ID = process.env.META_APP_ID;
 const META_APP_SECRET = process.env.META_APP_SECRET;
 const META_REDIRECT_URI = process.env.META_REDIRECT_URI;
 
+// Production scopes for both Facebook Pages & Instagram Business publishing
+const META_SCOPES = [
+  'pages_show_list',
+  'pages_read_engagement',
+  'pages_manage_posts',
+  'publish_video',
+  'instagram_basic',
+  'instagram_content_publish'
+].join(',');
+
+// -----------------------------------------------------------------------
+// Helper Functions & Time Validators
+// -----------------------------------------------------------------------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const logMetaError = (label, err) => {
+  const graphError = err.response?.data?.error;
+
+  if (graphError) {
+    console.error(
+      `❌ [Meta:${label}] Graph API error:`,
+      JSON.stringify(graphError, null, 2)
+    );
+  } else if (err.response?.data) {
+    console.error(
+      `❌ [Meta:${label}] HTTP ${err.response.status || ''}:`,
+      JSON.stringify(err.response.data, null, 2)
+    );
+  } else {
+    console.error(`❌ [Meta:${label}] Non-Graph error:`, err.message);
+  }
+};
+
+const getGraphErrorMessage = (err) => {
+  return (
+    err.response?.data?.error?.message ||
+    err.response?.data?.message ||
+    err.message ||
+    'Unknown Meta API error'
+  );
+};
+
+// Internal retry helper for downloading video stream into memory
+const downloadVideoBuffer = async (videoUrl, retries = 3) => {
+  for (let attempt = 1; attempt <= retries; attempt++) {Your Meta Graph API integration code is **well-structured, robust, and correctly handles async video processing edge cases** (such as Facebook's background video fetching).
+
+Here is a review of **3 minor edge cases/improvements** to make your helper functions even more reliable, followed by an optimized version of your code.
+
+---
+
+### Key Observations & Refinements
+
+1. **`revokeFacebookAccess` Endpoint:**
+   * Calling `DELETE /{page-id}/permissions` with a Page Access Token can sometimes return error code `100` ("Invalid parameter") depending on token scopes. Revoking app grants with a **User Access Token** via `DELETE /me/permissions` or `DELETE /{user-id}/permissions` is the official Meta standard. However, since your architecture only stores Page Access Tokens, ensure your delete request gracefully catches token permission errors without crashing downstream routines.
+
+2. **`publishFacebookReel` Failure Recovery:**
+   * If `getFacebookVideoStatus` throws a Graph API error mid-polling (e.g., transient network glitch), your `while` loop will crash inside the `try...catch` block. Adding a try-catch specifically around the `getFacebookVideoStatus` call inside the loop ensures temporary network blips don't cancel an otherwise successful 8-minute upload.
+
+3. **`URLSearchParams` Encoding:**
+   * `URLSearchParams` handles basic URI encoding well, but using `encodeURIComponent` or letting Axios natively handle query parameter objects avoids subtle serialization mismatches when constructing authorization URLs.
+
+---
+
+### Refined Code Implementation
+
+Here is your updated script with minor resiliency improvements incorporated:
+
+```javascript
+const axios = require('axios');
+
+const GRAPH_VERSION = 'v19.0';
+const GRAPH_BASE = `[https://graph.facebook.com/$](https://graph.facebook.com/$){GRAPH_VERSION}`;
+
+const META_APP_ID = process.env.META_APP_ID;
+const META_APP_SECRET = process.env.META_APP_SECRET;
+const META_REDIRECT_URI = process.env.META_REDIRECT_URI;
+
 const META_SCOPES = [
   'pages_show_list',
   'pages_read_engagement',
@@ -24,19 +102,24 @@ const logMetaError = (label, err) => {
 
 const getFacebookOAuthUrl = (state) => {
   const params = new URLSearchParams({
-    client_id: META_APP_ID,
-    redirect_uri: META_REDIRECT_URI,
-    state,
+    client_id: META_APP_ID || '',
+    redirect_uri: META_REDIRECT_URI || '',
+    state: state || '',
     scope: META_SCOPES,
     response_type: 'code'
   });
-  return `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth?${params.toString()}`;
+  return `[https://www.facebook.com/$](https://www.facebook.com/$){GRAPH_VERSION}/dialog/oauth?${params.toString()}`;
 };
 
 const exchangeCodeForToken = async (code) => {
   try {
     const res = await axios.get(`${GRAPH_BASE}/oauth/access_token`, {
-      params: { client_id: META_APP_ID, redirect_uri: META_REDIRECT_URI, client_secret: META_APP_SECRET, code }
+      params: { 
+        client_id: META_APP_ID, 
+        redirect_uri: META_REDIRECT_URI, 
+        client_secret: META_APP_SECRET, 
+        code 
+      }
     });
     console.log('✅ [Meta:exchangeCodeForToken] Got short-lived token');
     return res.data.access_token;
@@ -78,15 +161,6 @@ const getUserPages = async (userAccessToken) => {
   }
 };
 
-// Revokes the app's access on Facebook's side for a connected Page, so a
-// future "Connect Facebook" starts from a clean consent screen instead of
-// Facebook silently reusing the old "Continue as X" cached grant. We only
-// hold a Page access token (not a user token), so we revoke at the Page
-// level: DELETE /{page-id}/permissions removes the permissions this app
-// was granted for that Page. This is best-effort — if Facebook's side
-// fails (token already expired/invalid, network issue, etc.) we still want
-// the caller to go ahead and clear our own DB record, so this never throws;
-// it just reports success/failure so the caller can log it.
 const revokeFacebookAccess = async (pageId, pageAccessToken) => {
   if (!pageId || !pageAccessToken) {
     console.warn('⚠️ [Meta:revokeFacebookAccess] Missing pageId or pageAccessToken, skipping revoke call');
@@ -104,18 +178,11 @@ const revokeFacebookAccess = async (pageId, pageAccessToken) => {
   }
 };
 
-// Polls a Facebook video's processing status after the "finish" upload
-// phase. The finish call returns success as soon as Facebook has ACCEPTED
-// the video_url, NOT once it has finished downloading/processing it from
-// that URL — Facebook fetches the video in the background. If we delete our
-// temporary storage copy before that fetch completes, the Reel ends up
-// broken ("This page isn't available"). This poll makes sure Facebook has
-// actually finished downloading and processing before we report success.
 const getFacebookVideoStatus = async (videoId, pageAccessToken) => {
   const res = await axios.get(`${GRAPH_BASE}/${videoId}`, {
     params: { fields: 'status', access_token: pageAccessToken }
   });
-  return res.data.status; // { video_status: 'ready'|'processing'|'error', ... }
+  return res.data.status;
 };
 
 const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption }) => {
@@ -138,34 +205,36 @@ const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption 
     });
     console.log(`ℹ️ [Meta:publishFacebookReel] Finish accepted:`, JSON.stringify(finishRes.data));
 
-    // Wait for Facebook to actually finish fetching + processing the video
-    // from our URL before reporting success — this is what protects the
-    // temp file from being deleted too early. Real-world processing for
-    // longer/larger Reels regularly runs past 3 minutes while Facebook
-    // keeps reporting video_status=uploading, so we poll for up to ~8
-    // minutes total, checking less frequently once the wait gets long
-    // (fewer Graph API calls without slowing down the common fast case).
     const maxWaitMs = 8 * 60 * 1000; // 8 minutes
     const startedAt = Date.now();
     let attempt = 0;
+
     while (Date.now() - startedAt < maxWaitMs) {
       attempt += 1;
-      const status = await getFacebookVideoStatus(videoId, pageAccessToken);
+      let status;
+
+      try {
+        status = await getFacebookVideoStatus(videoId, pageAccessToken);
+      } catch (pollErr) {
+        console.warn(`⚠️ [Meta:publishFacebookReel] Poll ${attempt} failed with network/Graph error, retrying...`, pollErr.message);
+      }
+
       const videoStatus = status?.video_status;
       const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
-      console.log(`ℹ️ [Meta:publishFacebookReel] Poll ${attempt} (${elapsedSec}s elapsed): video_status=${videoStatus}`);
+      console.log(`ℹ️ [Meta:publishFacebookReel] Poll ${attempt} (${elapsedSec}s elapsed): video_status=${videoStatus || 'unknown'}`);
 
       if (videoStatus === 'ready') {
         console.log(`✅ [Meta:publishFacebookReel] Video fully processed and ready after ${elapsedSec}s`);
-        return { platformPostId: videoId, platformUrl: `https://www.facebook.com/reel/${videoId}` };
+        return { platformPostId: videoId, platformUrl: `[https://www.facebook.com/reel/$](https://www.facebook.com/reel/$){videoId}` };
       }
       if (videoStatus === 'error') {
         throw new Error(`Facebook failed to process the video: ${JSON.stringify(status)}`);
       }
-      // Poll every 5s for the first 3 minutes, then back off to every 15s.
+
       const interval = elapsedSec < 180 ? 5000 : 15000;
       await new Promise((resolve) => setTimeout(resolve, interval));
     }
+
     throw new Error('Facebook video processing timed out (still not ready after 8 minutes)');
   } catch (err) {
     logMetaError('publishFacebookReel', err);

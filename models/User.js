@@ -20,37 +20,14 @@ const ConnectedDriveSchema = new mongoose.Schema({
   tokenExpiryDate: Number,
   folderId: { type: String, default: null },
   folderName: { type: String, default: null },
-  // 'HH:mm' wall-clock time (IST) the user picked in "Daily Upload Time".
-  // Only meaningful when uploadMode === 'scheduled' — it's the time the
-  // 06:00-uploaded (unlisted) video is promoted to public. Ignored in
-  // 'live' mode, where the video goes public immediately.
   dailyUploadTime: { type: String, default: null },
-  // 'scheduled' (default): fixed 06:00 IST daily pull from Drive, uploads
-  //   unlisted, goes public at dailyUploadTime — normal production flow.
-  // 'live': TESTING mode. The scheduler checks this user EVERY MINUTE
-  //   (not just at 06:00) and uploads any new Drive video immediately,
-  //   straight to public — no unlisted staging, no waiting for a fixed
-  //   time. Meant for verifying the pipeline works without waiting for
-  //   the next real 06:00 IST trigger. Switching to 'live' also fires an
-  //   immediate one-off check right away (see routes/drive.js PATCH
-  //   /settings), instead of waiting for the next minute's cron tick.
   uploadMode: { type: String, enum: ['scheduled', 'live'], default: 'scheduled' },
   lastAutoUploadDate: { type: String, default: null },
   driveProcessedFileIds: [{ type: String }],
-  // 'YYYY-MM-DD' (IST) of the first day the Drive scan found NO new video
-  // to upload. Reset to null as soon as a new video is found again. If
-  // this stays set for >= 2 calendar days in a row, the scheduler
-  // auto-disconnects this user's Drive (see checkDriveInactivityAndDisconnect
-  // in backend/cron/scheduler.js). Only tracked for 'scheduled' mode.
   noNewVideoSinceDate: { type: String, default: null },
   connectedAt: { type: Date, default: Date.now }
 }, { _id: false });
 
-// Both Instagram and Facebook publishing go through a connected Facebook
-// Page's access token (Meta Graph API requirement — there is no separate
-// "Instagram-only" OAuth for content publishing). pageAccessToken is a
-// long-lived Page token (does not expire under normal use, but can be
-// invalidated by the user revoking access).
 const ConnectedFacebookSchema = new mongoose.Schema({
   pageId: String,
   pageName: String,
@@ -58,10 +35,6 @@ const ConnectedFacebookSchema = new mongoose.Schema({
   connectedAt: { type: Date, default: Date.now }
 }, { _id: false });
 
-// igUserId/igUsername come from the Facebook Page's linked Instagram
-// Business/Creator account. Publishing uses the SAME pageAccessToken stored
-// on connectedFacebook above (Instagram Graph API calls are authenticated
-// with the Page token, not a separate Instagram token).
 const ConnectedInstagramSchema = new mongoose.Schema({
   igUserId: String,
   igUsername: String,
@@ -84,7 +57,7 @@ const UserSchema = new mongoose.Schema({
   referredBy: { type: String, default: null },
   diamondBalance: { type: Number, default: 0 },
   autoRefillDiamonds: { type: Boolean, default: false },
-  freeUploadsRemaining: { type: Number, default: 20 },
+  freeUploadsRemaining: { type: Number, default: 20 }, // 20 Free Upload Credits
   freeUploadsResetAt: { type: Date, default: () => new Date(new Date().setMonth(new Date().getMonth() + 1)) },
   storageUsedBytes: { type: Number, default: 0 },
   fcmTokens: [{ type: String }],
@@ -132,14 +105,5 @@ UserSchema.methods.toSafeObject = function () {
   }
   return obj;
 };
-
-// NOTE (Delete Account feature): actual cascade delete (Video, Transaction,
-// Notification docs) lives in routes/admin.js so it can run inside a single
-// place alongside the User.findByIdAndDelete call, and so this model file
-// doesn't need to require other models (avoids circular-require risk).
-// This model itself needs no schema changes for the feature — deleting the
-// User document is enough to make a future re-login generate a brand new
-// userId/referralCode/diamondBalance/freeUploadsRemaining, since those are
-// all schema defaults, not something looked up from old data.
 
 module.exports = mongoose.model('User', UserSchema);

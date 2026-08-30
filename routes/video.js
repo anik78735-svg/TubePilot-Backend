@@ -11,9 +11,8 @@ const router = express.Router();
 
 const DIAMOND_COST_PER_UPLOAD = Number(process.env.DIAMOND_COST_PER_UPLOAD || 10);
 
-// Deducts either a free upload slot or diamonds. Charged ONCE per upload
-// regardless of how many platforms are selected — the user uploads one
-// video file, not one per platform.
+// Deducts 1 Free Credit OR 10 Diamonds ONCE per upload event,
+// regardless of 1, 2, or 3 platforms selected (YouTube, FB, IG, Carousel).
 const chargeForUpload = (user) => {
   if (user.freeUploadsRemaining > 0) {
     user.freeUploadsRemaining -= 1;
@@ -28,7 +27,6 @@ const chargeForUpload = (user) => {
   throw err;
 };
 
-// Uploads the raw video buffer to storage, trying Cloudinary 1 -> Cloudinary 2 -> Google Drive
 const storeVideoFile = async (buffer, filename, mimetype) => {
   const picked = await pickAvailableCloudinaryAccount(buffer.length);
   if (picked) {
@@ -45,30 +43,6 @@ const parseJson = (str, fallback = {}) => {
 };
 
 // @route POST /api/videos/upload
-// multipart/form-data:
-//   video (file, required), thumbnail (file, optional — YouTube only)
-//   platforms: JSON array e.g. '["youtube","facebook"]'
-//   youtube:   JSON e.g. '{"title":"...","description":"...","tags":"a,b",
-//                          "category":"22","playlist":"","audience":"not_for_kids",
-//                          "privacyStatus":"public","scheduledAt":"2026-08-05T18:00:00Z"}'
-//   facebook:  JSON e.g. '{"caption":"...","hashtags":"a,b",
-//                          "scheduledAt":"2026-08-05T20:30:00Z"}'
-//
-// Scheduling behaviour (important — differs by platform):
-//   - YouTube: the video uploads to YouTube IMMEDIATELY, no matter what
-//     scheduledAt is. If scheduledAt is in the future, it uploads as
-//     'unlisted' and the scheduler (cron/scheduler.js) flips it to the
-//     user's chosen privacyStatus (targetPrivacyStatus) the moment
-//     scheduledAt arrives — this way the video is already fully processed
-//     on YouTube's side and "goes public" instantly at the scheduled time
-//     instead of only starting the (slow) upload then. That's why YouTube
-//     targets are created with status 'queued' here regardless of
-//     scheduledAt — never 'pending'.
-//   - Facebook: Reels have no "unlisted, reveal later" option via the
-//     Graph API, so scheduling just delays WHEN we publish. A future
-//     scheduledAt keeps the Facebook target 'pending' until the scheduler
-//     promotes it to 'queued' at that time; no scheduledAt (or a past one)
-//     means it goes straight to 'queued' and publishes right away.
 router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
   try {
     const user = req.user;
@@ -81,8 +55,7 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       return res.status(400).json({ success: false, message: 'Select at least one platform' });
     }
 
-    // Validate every requested platform is actually connected BEFORE
-    // charging anything.
+    // Validate account connection before charging
     for (const p of platformsRequested) {
       if (p === 'youtube' && !user.youtubeChannel) {
         return res.status(400).json({ success: false, message: 'Connect your YouTube channel first', code: 'YOUTUBE_NOT_CONNECTED' });
@@ -90,9 +63,12 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       if (p === 'facebook' && !user.connectedFacebook) {
         return res.status(400).json({ success: false, message: 'Connect Facebook first', code: 'FACEBOOK_NOT_CONNECTED' });
       }
+      if (p === 'instagram' && !user.connectedInstagram) {
+        return res.status(400).json({ success: false, message: 'Connect Instagram first', code: 'INSTAGRAM_NOT_CONNECTED' });
+      }
     }
 
-    // Charge BEFORE the (slow) upload so we never store a video the user can't afford.
+    // Charge 1 Free Credit OR 10 Diamonds once for this entire upload action
     const charge = chargeForUpload(user);
 
     const videoFile = req.files.video[0];
@@ -109,6 +85,9 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       thumbnailUrl = thumbUpload ? thumbUpload.secure_url : '';
     }
 
+    const postTypeRequested = req.body.postType || 'video';
+    const mediaUrlsRequested = parseJson(req.body.mediaUrls, [stored.storageUrl]);
+
     const platforms = [];
     for (const p of platformsRequested) {
       if (p === 'youtube') {
@@ -117,11 +96,7 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
         const scheduledAt = yt.scheduledAt ? new Date(yt.scheduledAt) : null;
         platforms.push({
           platform: 'youtube',
-          // Always 'queued' — YouTube uploads immediately (see note above).
-          // The scheduler decides at upload time whether to upload as
-          // unlisted (if scheduledAt is in the future) or straight to
-          // requestedPrivacy, and later promotes unlisted -> requestedPrivacy
-          // once scheduledAt is reached.
+          postType: 'video',
           status: 'queued',
           scheduledAt,
           title: yt.title || '',
@@ -140,10 +115,22 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
         const scheduledAt = fb.scheduledAt ? new Date(fb.scheduledAt) : null;
         platforms.push({
           platform: 'facebook',
+          postType: postTypeRequested,
           status: scheduledAt && scheduledAt > new Date() ? 'pending' : 'queued',
           scheduledAt,
           caption: fb.caption || '',
           hashtags: parseCommaList(fb.hashtags)
+        });
+      } else if (p === 'instagram') {
+        const ig = parseJson(req.body.instagram, {});
+        const scheduledAt = ig.scheduledAt ? new Date(ig.scheduledAt) : null;
+        platforms.push({
+          platform: 'instagram',
+          postType: postTypeRequested,
+          status: scheduledAt && scheduledAt > new Date() ? 'pending' : 'queued',
+          scheduledAt,
+          caption: ig.caption || '',
+          hashtags: parseCommaList(ig.hashtags)
         });
       }
     }
@@ -157,8 +144,12 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
       storageProvider: stored.storageProvider,
       storageFileId: stored.storageFileId,
       storageUrl: stored.storageUrl,
+      videoUrl: stored.storageUrl,
+      mediaUrls: mediaUrlsRequested,
       fileSizeBytes: videoFile.size,
       platforms,
+      postType: postTypeRequested,
+      platform: platformsRequested.length > 1 ? 'multi' : platformsRequested[0],
       status: 'queued',
       diamondsCharged: charge.diamondsCharged,
       usedFreeUpload: charge.usedFreeUpload
@@ -172,7 +163,7 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
     if (err.code === 'INSUFFICIENT_DIAMONDS') {
       sendOneSignalToUser(req.user, {
         title: 'Your credits are over 💎',
-        body: 'Your free uploads and diamonds are used up. Please buy diamonds to upload your video.',
+        body: 'Your free uploads and diamonds are used up. Please buy diamonds to upload.',
         data: { type: 'insufficient_diamonds' }
       }).catch(() => {});
       return res.status(402).json({ success: false, message: err.message, code: err.code });
@@ -181,7 +172,6 @@ router.post('/upload', protect, upload.fields([{ name: 'video', maxCount: 1 }, {
   }
 });
 
-// @route GET /api/videos?status=queued|uploaded|draft|failed|partially_uploaded
 router.get('/', protect, async (req, res) => {
   try {
     const filter = { user: req.user._id };
@@ -193,7 +183,6 @@ router.get('/', protect, async (req, res) => {
   }
 });
 
-// @route GET /api/videos/:id
 router.get('/:id', protect, async (req, res) => {
   try {
     const video = await Video.findOne({ _id: req.params.id, user: req.user._id });
@@ -204,14 +193,6 @@ router.get('/:id', protect, async (req, res) => {
   }
 });
 
-// @route PATCH /api/videos/:id/schedule/:platform  { scheduledAt }
-// Reschedule ONE platform target on a video (e.g. only push Facebook's time
-// back, or move up when a YouTube video goes public).
-//
-// For YouTube: if the video was already uploaded (unlisted) and is waiting
-// to be promoted, this just changes WHEN the promotion happens — no
-// re-upload. If it hasn't uploaded yet, it stays 'queued' as usual (see
-// upload route notes above).
 router.patch('/:id/schedule/:platform', protect, async (req, res) => {
   try {
     const { scheduledAt } = req.body;
@@ -228,10 +209,6 @@ router.patch('/:id/schedule/:platform', protect, async (req, res) => {
         return res.status(400).json({ success: false, message: 'This video is already public on YouTube' });
       }
       target.scheduledAt = new Date(scheduledAt);
-      // If it hasn't uploaded yet, leave it 'queued' so it uploads right
-      // away (as unlisted, since scheduledAt is presumably in the future).
-      // If it's already uploaded and unlisted, it just waits for the new
-      // scheduledAt to be promoted — status stays 'uploaded'.
       if (target.status !== 'uploaded') {
         target.status = 'queued';
       }
@@ -250,13 +227,12 @@ router.patch('/:id/schedule/:platform', protect, async (req, res) => {
   }
 });
 
-// @route DELETE /api/videos/:id  (cancel every not-yet-uploaded platform target)
 router.delete('/:id', protect, async (req, res) => {
   try {
     const video = await Video.findOne({ _id: req.params.id, user: req.user._id });
     if (!video) return res.status(404).json({ success: false, message: 'Video not found' });
     if (video.status === 'uploaded') {
-      return res.status(400).json({ success: false, message: 'Cannot delete an already fully-uploaded video from here' });
+      return res.status(400).json({ success: false, message: 'Cannot delete an already fully-uploaded video' });
     }
 
     if (video.usedFreeUpload) {
@@ -271,7 +247,7 @@ router.delete('/:id', protect, async (req, res) => {
       user: req.user._id,
       type: 'upload_failed',
       title: 'Upload Cancelled',
-      message: 'Your upload was cancelled and your credit was refunded.'
+      message: 'Your upload was cancelled and your credit/diamonds were refunded.'
     });
 
     res.json({ success: true, message: 'Video cancelled and credit refunded' });

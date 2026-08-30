@@ -1,43 +1,31 @@
 const mongoose = require('mongoose');
 
-// Per-platform publish record. Each video can target multiple platforms
-// independently — each with its own metadata, schedule time, and status, so
-// (for example) YouTube can succeed while Facebook fails and only
-// Facebook gets retried.
+// Per-platform publish record
 const PlatformTargetSchema = new mongoose.Schema({
-  platform: { type: String, enum: ['youtube', 'facebook'], required: true },
+  platform: { type: String, enum: ['youtube', 'facebook', 'instagram'], required: true },
+  postType: { type: String, enum: ['video', 'reel', 'carousel', 'post'], default: 'video' },
   status: {
     type: String,
     enum: ['pending', 'queued', 'processing', 'uploaded', 'failed'],
     default: 'pending'
   },
-  scheduledAt: { type: Date, default: null }, // null = publish as soon as the video is queued
+  scheduledAt: { type: Date, default: null },
 
-  // YouTube-specific metadata
+  // Metadata fields
   title: { type: String, default: '' },
   description: { type: String, default: '' },
+  caption: { type: String, default: '' },
   tags: [{ type: String }],
+  hashtags: [{ type: String }],
   category: { type: String, default: '22' },
   playlist: { type: String, default: '' },
   audience: { type: String, enum: ['made_for_kids', 'not_for_kids'], default: 'not_for_kids' },
   privacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: 'public' },
   targetPrivacyStatus: { type: String, enum: ['public', 'unlisted', 'private'], default: null },
-  // YouTube only. When a target has a future scheduledAt, the scheduler
-  // uploads it immediately as 'unlisted' so it's fully processed and ready,
-  // then flips it to targetPrivacyStatus once scheduledAt arrives (see
-  // cron/scheduler.js -> promoteScheduledYouTubeVideos). This flag tracks
-  // whether that final promotion has happened yet — false right after the
-  // initial (possibly unlisted) upload, true once it's at its real target
-  // privacy. For targets with no future schedule, this is set to true at
-  // upload time since there's nothing left to promote.
   youtubePrivacyPromoted: { type: Boolean, default: false },
   thumbnailUrl: { type: String, default: '' },
 
-  // Facebook metadata
-  caption: { type: String, default: '' },
-  hashtags: [{ type: String }],
-
-  // Result fields, populated once processed
+  // Result fields
   platformPostId: { type: String, default: '' },
   platformUrl: { type: String, default: '' },
   failReason: { type: String, default: '' },
@@ -47,33 +35,38 @@ const PlatformTargetSchema = new mongoose.Schema({
 const VideoSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
 
-  // The ONE video file the user uploaded — shared across every platform
-  // target below. We upload it once to temporary storage and reuse the same
-  // file/URL for every platform, per the "upload once, publish everywhere"
-  // requirement.
-  storageProvider: { type: String, enum: ['cloudinary_1', 'cloudinary_2', 'google_drive', 'youtube'], default: null },
+  // Storage and Source
+  storageProvider: { type: String, enum: ['cloudinary_1', 'cloudinary_2', 'google_drive', 'youtube', 'direct_url'], default: null },
   storageFileId: { type: String, default: '' },
   storageUrl: { type: String, default: '' },
+  
+  // Single Video OR Carousel Media Items Support
+  videoUrl: { type: String, default: '' },
+  mediaUrls: [{ type: String }], // Multi-item support for Instagram Carousel
+  
   fileSizeBytes: { type: Number, default: 0 },
   storageDeleteAt: { type: Date, default: null },
 
   sourceProvider: { type: String, enum: ['manual', 'drive_auto'], default: 'manual' },
   sourceDriveFileId: { type: String, default: '' },
 
-  // One entry per platform the user selected for this video.
+  // Platform details & root-level quick access fields
+  platform: { type: String, enum: ['youtube', 'facebook', 'instagram', 'multi'], default: 'youtube' },
+  postType: { type: String, enum: ['video', 'reel', 'carousel', 'post'], default: 'video' },
+  platformPostId: { type: String, default: '' },
+  platformUrl: { type: String, default: '' },
+
+  // Platforms Target Array
   platforms: { type: [PlatformTargetSchema], default: [] },
 
-  // Overall status derived from platforms[] — 'uploaded' only once every
-  // platform target is uploaded; 'failed' if every target failed; otherwise
-  // 'processing'/'queued' while any target is still in flight. Kept as an
-  // explicit field (rather than computed only on read) so existing queries
-  // like Video.find({ status: 'queued' }) keep working.
+  // Status
   status: {
     type: String,
     enum: ['draft', 'queued', 'processing', 'uploaded', 'partially_uploaded', 'failed'],
     default: 'draft'
   },
 
+  // Credits tracking
   diamondsCharged: { type: Number, default: 0 },
   usedFreeUpload: { type: Boolean, default: false },
 
@@ -86,14 +79,6 @@ const VideoSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
-// Recomputes the parent `status` field from the current state of
-// `platforms[]`. Call this after mutating any platform target's status.
-//
-// NOTE: a YouTube target that's 'uploaded' but still waiting on
-// youtubePrivacyPromoted (i.e. uploaded unlisted, waiting for its
-// scheduled public time) still counts as 'uploaded' here — the promotion
-// step is a background metadata patch, not part of the publish pipeline
-// that this status tracks.
 VideoSchema.methods.recomputeStatus = function () {
   const statuses = this.platforms.map((p) => p.status);
   if (statuses.length === 0) { this.status = 'draft'; return; }

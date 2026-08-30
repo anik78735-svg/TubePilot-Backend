@@ -11,9 +11,6 @@ const { deleteUserAccountCascade } = require('../utils/user');
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// Helper: build tokens + set refresh cookie (web) + save refresh token on user doc
-// Also RETURNS the refreshToken so mobile (Flutter) clients can store it locally
-// and send it back in the request body (they can't rely on httpOnly cookies).
 const issueTokens = async (res, user) => {
   const accessToken = generateAccessToken(user._id);
   const refreshToken = generateRefreshToken(user._id);
@@ -47,10 +44,6 @@ router.post('/signup', async (req, res) => {
     const userId = await generateUserId();
     const referralCode = await generateReferralCode(userId);
 
-    // No starter diamond bonus here — diamondBalance defaults to 0 (see
-    // models/User.js). Diamonds are only granted when the user applies a
-    // valid referral code via POST /api/auth/apply-referral. If they skip
-    // entering a referral code, they simply stay at 0 diamonds.
     const user = await User.create({
       userId,
       name: name || '',
@@ -90,7 +83,6 @@ router.post('/login', async (req, res) => {
 });
 
 // @route POST /api/auth/google
-// body: { idToken } - Google ID token from frontend Google Sign-In button
 router.post('/google', async (req, res) => {
   try {
     const { idToken } = req.body;
@@ -110,8 +102,6 @@ router.post('/google', async (req, res) => {
     if (!user) {
       const userId = await generateUserId();
       const referralCode = await generateReferralCode(userId);
-      // Same as local signup — no starter diamond bonus. diamondBalance
-      // defaults to 0 (see models/User.js) until a referral code is applied.
       user = await User.create({
         userId,
         name: payload.name,
@@ -167,25 +157,6 @@ router.post('/logout', protect, async (req, res) => {
   }
 });
 
-// @route POST /api/auth/forgot-password
-router.post('/forgot-password', async (req, res) => {
-  try {
-    const { email } = req.body;
-    const user = await User.findOne({ email: (email || '').toLowerCase() });
-    // Always respond success to avoid leaking which emails are registered
-    if (!user) return res.json({ success: true, message: 'If that email exists, a reset link has been sent' });
-
-    const resetToken = crypto.randomBytes(32).toString('hex');
-    // In production: save hashed token + expiry on user, email the link via SMTP/SendGrid etc.
-    // This is left as a real integration point — plug in your email provider here.
-    console.log(`Password reset requested for ${user.email}. Token: ${resetToken}`);
-
-    res.json({ success: true, message: 'If that email exists, a reset link has been sent' });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
 // @route GET /api/auth/me
 router.get('/me', protect, async (req, res) => {
   res.json({ success: true, user: req.user.toSafeObject() });
@@ -212,18 +183,8 @@ router.post('/setup-username', protect, async (req, res) => {
   }
 });
 
-// @route POST /api/auth/apply-referral  { referralCode }
-// Called once, typically right after signup (e.g. during the "enter referral
-// code or skip" onboarding step). Both the new user and the referrer get a
-// diamond bonus. Real logic — validates the code belongs to someone else and
-// hasn't already been used by this user.
-//
-// The NEW user only ever receives diamonds through this route — signup
-// itself grants 0 diamonds (see models/User.js default + routes/auth.js
-// signup/google routes). If the user skips entering a referral code, this
-// route is simply never called and they stay at 0 diamonds.
-const REFERRAL_SIGNUP_BONUS_DIAMONDS = 10; // what the NEW user gets for entering a valid referral code
-const REFERRER_BONUS_DIAMONDS = 5;          // what the referrer gets when their code is used
+const REFERRAL_SIGNUP_BONUS_DIAMONDS = 10;
+const REFERRER_BONUS_DIAMONDS = 5;
 
 router.post('/apply-referral', protect, async (req, res) => {
   try {
@@ -259,31 +220,12 @@ router.post('/apply-referral', protect, async (req, res) => {
   }
 });
 
-// @route DELETE /api/auth/delete-account
-// Self-service account deletion — required by Google Play's Account
-// Deletion policy for any app that lets users create accounts. This is the
-// USER deleting their OWN account (no id in the URL — always operates on
-// req.user, set by the `protect` middleware from their access token). The
-// admin equivalent (an admin deleting someone else's account) is
-// DELETE /api/admin/users/:id in routes/admin.js.
-//
-// Both routes call the exact same deleteUserAccountCascade() from
-// utils/user.js, so there is one source of truth for what "delete a user"
-// actually wipes (Cloudinary files, Drive disconnect, Video/Transaction/
-// Notification docs, User doc) — see utils/user.js for the full breakdown
-// and the field-name assumptions it depends on.
-//
-// Admin accounts are blocked from self-deleting here too, same as the
-// admin route blocks deleting other admins — an admin accidentally wiping
-// their own (possibly only) admin account with no recovery path is a real
-// footgun, so they're required to go through a deliberate separate process
-// for that (e.g. direct DB access), not this one-tap flow.
 router.delete('/delete-account', protect, async (req, res) => {
   try {
     if (req.user.role === 'admin') {
       return res.status(400).json({
         success: false,
-        message: 'Admin accounts cannot be deleted from the app. Contact another admin or use direct database access.'
+        message: 'Admin accounts cannot be deleted from the app. Contact support or use direct database access.'
       });
     }
 
@@ -292,7 +234,7 @@ router.delete('/delete-account', protect, async (req, res) => {
     res.clearCookie('refreshToken');
 
     const storageNote = cloudinaryCleanup.failed.length
-      ? ` (${cloudinaryCleanup.failed.length} of ${cloudinaryCleanup.attempted} file(s) had cleanup issues — logged for review)`
+      ? ` (${cloudinaryCleanup.failed.length} file(s) had cleanup issues)`
       : '';
 
     res.json({

@@ -7,7 +7,7 @@ const META_APP_ID = process.env.META_APP_ID;
 const META_APP_SECRET = process.env.META_APP_SECRET;
 const META_REDIRECT_URI = process.env.META_REDIRECT_URI;
 
-// Production scopes for both Facebook Pages & Instagram Business publishing
+// Scopes required for Facebook Pages & linked Instagram Business/Creator accounts
 const META_SCOPES = [
   'pages_show_list',
   'pages_read_engagement',
@@ -17,88 +17,23 @@ const META_SCOPES = [
   'instagram_content_publish'
 ].join(',');
 
-// -----------------------------------------------------------------------
-// Helper Functions & Time Validators
-// -----------------------------------------------------------------------
-
+// Helper delay
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const logMetaError = (label, err) => {
-  const graphError = err.response?.data?.error;
-
-  if (graphError) {
-    console.error(
-      `❌ [Meta:${label}] Graph API error:`,
-      JSON.stringify(graphError, null, 2)
-    );
-  } else if (err.response?.data) {
-    console.error(
-      `❌ [Meta:${label}] HTTP ${err.response.status || ''}:`,
-      JSON.stringify(err.response.data, null, 2)
-    );
-  } else {
-    console.error(`❌ [Meta:${label}] Non-Graph error:`, err.message);
-  }
-};
-
-const getGraphErrorMessage = (err) => {
-  return (
-    err.response?.data?.error?.message ||
-    err.response?.data?.message ||
-    err.message ||
-    'Unknown Meta API error'
-  );
-};
-
-// Internal retry helper for downloading video stream into memory
-const downloadVideoBuffer = async (videoUrl, retries = 3) => {
-  for (let attempt = 1; attempt <= retries; attempt++) {Your Meta Graph API integration code is **well-structured, robust, and correctly handles async video processing edge cases** (such as Facebook's background video fetching).
-
-Here is a review of **3 minor edge cases/improvements** to make your helper functions even more reliable, followed by an optimized version of your code.
-
----
-
-### Key Observations & Refinements
-
-1. **`revokeFacebookAccess` Endpoint:**
-   * Calling `DELETE /{page-id}/permissions` with a Page Access Token can sometimes return error code `100` ("Invalid parameter") depending on token scopes. Revoking app grants with a **User Access Token** via `DELETE /me/permissions` or `DELETE /{user-id}/permissions` is the official Meta standard. However, since your architecture only stores Page Access Tokens, ensure your delete request gracefully catches token permission errors without crashing downstream routines.
-
-2. **`publishFacebookReel` Failure Recovery:**
-   * If `getFacebookVideoStatus` throws a Graph API error mid-polling (e.g., transient network glitch), your `while` loop will crash inside the `try...catch` block. Adding a try-catch specifically around the `getFacebookVideoStatus` call inside the loop ensures temporary network blips don't cancel an otherwise successful 8-minute upload.
-
-3. **`URLSearchParams` Encoding:**
-   * `URLSearchParams` handles basic URI encoding well, but using `encodeURIComponent` or letting Axios natively handle query parameter objects avoids subtle serialization mismatches when constructing authorization URLs.
-
----
-
-### Refined Code Implementation
-
-Here is your updated script with minor resiliency improvements incorporated:
-
-```javascript
-const axios = require('axios');
-
-const GRAPH_VERSION = 'v19.0';
-const GRAPH_BASE = `[https://graph.facebook.com/$](https://graph.facebook.com/$){GRAPH_VERSION}`;
-
-const META_APP_ID = process.env.META_APP_ID;
-const META_APP_SECRET = process.env.META_APP_SECRET;
-const META_REDIRECT_URI = process.env.META_REDIRECT_URI;
-
-const META_SCOPES = [
-  'pages_show_list',
-  'pages_read_engagement',
-  'pages_manage_posts'
-].join(',');
 
 const logMetaError = (label, err) => {
   const graphError = err.response?.data?.error;
   if (graphError) {
     console.error(`❌ [Meta:${label}] Graph API error:`, JSON.stringify(graphError, null, 2));
+  } else if (err.response?.data) {
+    console.error(`❌ [Meta:${label}] HTTP ${err.response.status || ''}:`, JSON.stringify(err.response.data, null, 2));
   } else {
     console.error(`❌ [Meta:${label}] Non-Graph error:`, err.message);
   }
 };
+
+// -----------------------------------------------------------------------
+// Authentication & Account Management
+// -----------------------------------------------------------------------
 
 const getFacebookOAuthUrl = (state) => {
   const params = new URLSearchParams({
@@ -108,7 +43,7 @@ const getFacebookOAuthUrl = (state) => {
     scope: META_SCOPES,
     response_type: 'code'
   });
-  return `[https://www.facebook.com/$](https://www.facebook.com/$){GRAPH_VERSION}/dialog/oauth?${params.toString()}`;
+  return `https://www.facebook.com/${GRAPH_VERSION}/dialog/oauth?${params.toString()}`;
 };
 
 const exchangeCodeForToken = async (code) => {
@@ -150,13 +85,38 @@ const getLongLivedUserToken = async (shortLivedToken) => {
 const getUserPages = async (userAccessToken) => {
   try {
     const res = await axios.get(`${GRAPH_BASE}/me/accounts`, {
-      params: { access_token: userAccessToken, fields: 'id,name,access_token' }
+      params: { access_token: userAccessToken, fields: 'id,name,access_token,instagram_business_account' }
     });
     const pages = res.data.data || [];
     console.log(`✅ [Meta:getUserPages] Found ${pages.length} page(s):`, pages.map((p) => p.name).join(', ') || '(none)');
     return pages;
   } catch (err) {
     logMetaError('getUserPages', err);
+    throw err;
+  }
+};
+
+/**
+ * Fetch the Instagram Business / Creator Account ID linked to a Facebook Page
+ */
+const getInstagramAccountId = async (pageId, pageAccessToken) => {
+  try {
+    const res = await axios.get(`${GRAPH_BASE}/${pageId}`, {
+      params: {
+        fields: 'instagram_business_account',
+        access_token: pageAccessToken
+      }
+    });
+
+    const igAccountId = res.data?.instagram_business_account?.id;
+    if (!igAccountId) {
+      throw new Error(`No Instagram Business Account linked to Facebook Page ID ${pageId}`);
+    }
+
+    console.log(`✅ [Meta:getInstagramAccountId] Found IG Account ID: ${igAccountId}`);
+    return igAccountId;
+  } catch (err) {
+    logMetaError('getInstagramAccountId', err);
     throw err;
   }
 };
@@ -177,6 +137,10 @@ const revokeFacebookAccess = async (pageId, pageAccessToken) => {
     return { revoked: false, reason: err.response?.data?.error?.message || err.message };
   }
 };
+
+// -----------------------------------------------------------------------
+// Facebook Reels Publishing
+// -----------------------------------------------------------------------
 
 const getFacebookVideoStatus = async (videoId, pageAccessToken) => {
   const res = await axios.get(`${GRAPH_BASE}/${videoId}`, {
@@ -216,7 +180,7 @@ const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption 
       try {
         status = await getFacebookVideoStatus(videoId, pageAccessToken);
       } catch (pollErr) {
-        console.warn(`⚠️ [Meta:publishFacebookReel] Poll ${attempt} failed with network/Graph error, retrying...`, pollErr.message);
+        console.warn(`⚠️ [Meta:publishFacebookReel] Poll ${attempt} failed, retrying...`, pollErr.message);
       }
 
       const videoStatus = status?.video_status;
@@ -224,15 +188,15 @@ const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption 
       console.log(`ℹ️ [Meta:publishFacebookReel] Poll ${attempt} (${elapsedSec}s elapsed): video_status=${videoStatus || 'unknown'}`);
 
       if (videoStatus === 'ready') {
-        console.log(`✅ [Meta:publishFacebookReel] Video fully processed and ready after ${elapsedSec}s`);
-        return { platformPostId: videoId, platformUrl: `[https://www.facebook.com/reel/$](https://www.facebook.com/reel/$){videoId}` };
+        console.log(`✅ [Meta:publishFacebookReel] Video fully processed after ${elapsedSec}s`);
+        return { platformPostId: videoId, platformUrl: `https://www.facebook.com/reel/${videoId}` };
       }
       if (videoStatus === 'error') {
         throw new Error(`Facebook failed to process the video: ${JSON.stringify(status)}`);
       }
 
       const interval = elapsedSec < 180 ? 5000 : 15000;
-      await new Promise((resolve) => setTimeout(resolve, interval));
+      await sleep(interval);
     }
 
     throw new Error('Facebook video processing timed out (still not ready after 8 minutes)');
@@ -242,11 +206,225 @@ const publishFacebookReel = async ({ pageId, pageAccessToken, videoUrl, caption 
   }
 };
 
+// -----------------------------------------------------------------------
+// Instagram Publishing (Reels & Carousels)
+// -----------------------------------------------------------------------
+
+/**
+ * Checks status of an Instagram Media Container during processing
+ */
+const getInstagramContainerStatus = async (creationId, pageAccessToken) => {
+  const res = await axios.get(`${GRAPH_BASE}/${creationId}`, {
+    params: {
+      fields: 'status_code,status',
+      access_token: pageAccessToken
+    }
+  });
+  return res.data; // { status_code: 'EXPIRED' | 'ERROR' | 'FINISHED' | 'IN_PROGRESS', ... }
+};
+
+/**
+ * Polls an Instagram container until status_code becomes 'FINISHED'
+ */
+const waitForInstagramContainer = async (creationId, pageAccessToken, maxWaitMs = 8 * 60 * 1000) => {
+  const startedAt = Date.now();
+  let attempt = 0;
+
+  while (Date.now() - startedAt < maxWaitMs) {
+    attempt += 1;
+    let statusData;
+
+    try {
+      statusData = await getInstagramContainerStatus(creationId, pageAccessToken);
+    } catch (pollErr) {
+      console.warn(`⚠️ [Meta:waitForInstagramContainer] Poll ${attempt} failed for ${creationId}, retrying...`, pollErr.message);
+    }
+
+    const statusCode = statusData?.status_code;
+    const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+    console.log(`ℹ️ [Meta:waitForInstagramContainer] Poll ${attempt} (${elapsedSec}s elapsed): status_code=${statusCode || 'unknown'}`);
+
+    if (statusCode === 'FINISHED') {
+      return true;
+    }
+
+    if (statusCode === 'ERROR' || statusCode === 'EXPIRED') {
+      throw new Error(`Instagram container ${creationId} failed processing with status: ${statusCode}`);
+    }
+
+    const interval = elapsedSec < 180 ? 5000 : 15000;
+    await sleep(interval);
+  }
+
+  throw new Error(`Instagram container ${creationId} timed out after ${Math.round(maxWaitMs / 1000)}s`);
+};
+
+/**
+ * Publishes a Reel to a connected Instagram Business/Creator Account
+ */
+const publishInstagramReel = async ({ igUserId, pageAccessToken, videoUrl, caption }) => {
+  try {
+    console.log(`▶️ [Meta:publishInstagramReel] Starting for IG user ${igUserId}, video: ${videoUrl}`);
+
+    // STEP 1: Create Media Container for Reel
+    const createRes = await axios.post(`${GRAPH_BASE}/${igUserId}/media`, null, {
+      params: {
+        media_type: 'REELS',
+        video_url: videoUrl,
+        caption: caption || '',
+        access_token: pageAccessToken
+      }
+    });
+
+    const creationId = createRes.data.id;
+    console.log(`ℹ️ [Meta:publishInstagramReel] Container created, creation_id=${creationId}`);
+
+    // STEP 2: Wait for video container processing to complete
+    await waitForInstagramContainer(creationId, pageAccessToken);
+
+    // STEP 3: Publish Media Container
+    console.log(`▶️ [Meta:publishInstagramReel] Publishing container ${creationId}...`);
+    const publishRes = await axios.post(`${GRAPH_BASE}/${igUserId}/media_publish`, null, {
+      params: {
+        creation_id: creationId,
+        access_token: pageAccessToken
+      }
+    });
+
+    const mediaId = publishRes.data.id;
+    console.log(`✅ [Meta:publishInstagramReel] Published successfully, media_id=${mediaId}`);
+
+    let permalink = `https://www.instagram.com/reel/${mediaId}`;
+    try {
+      const permalinkRes = await axios.get(`${GRAPH_BASE}/${mediaId}`, {
+        params: { fields: 'permalink', access_token: pageAccessToken }
+      });
+      if (permalinkRes.data?.permalink) {
+        permalink = permalinkRes.data.permalink;
+      }
+    } catch (e) {
+      // Non-critical error
+    }
+
+    return {
+      platformPostId: mediaId,
+      platformUrl: permalink
+    };
+
+  } catch (err) {
+    logMetaError('publishInstagramReel', err);
+    throw err;
+  }
+};
+
+/**
+ * Publishes a multi-item Carousel (Images/Videos) to Instagram
+ * @param {Object} params
+ * @param {string} params.igUserId - Instagram Business/Creator Account ID
+ * @param {string} params.pageAccessToken - Page Access Token
+ * @param {Array<{ url: string, isVideo?: boolean }>} params.mediaItems - Array of 2-10 items
+ * @param {string} [params.caption] - Caption for the carousel post
+ */
+const publishInstagramCarousel = async ({ igUserId, pageAccessToken, mediaItems, caption }) => {
+  try {
+    if (!Array.isArray(mediaItems) || mediaItems.length < 2 || mediaItems.length > 10) {
+      throw new Error('Instagram Carousel requires between 2 and 10 media items.');
+    }
+
+    console.log(`▶️ [Meta:publishInstagramCarousel] Starting for IG user ${igUserId} with ${mediaItems.length} items`);
+
+    // STEP 1: Create child item containers for each media asset
+    const childrenIds = [];
+
+    for (let index = 0; index < mediaItems.length; index++) {
+      const item = mediaItems[index];
+      const isVideo = !!item.isVideo;
+
+      console.log(`ℹ️ [Meta:publishInstagramCarousel] Processing item ${index + 1}/${mediaItems.length} (${isVideo ? 'VIDEO' : 'IMAGE'})`);
+
+      const params = {
+        is_carousel_item: true,
+        access_token: pageAccessToken
+      };
+
+      if (isVideo) {
+        params.media_type = 'VIDEO';
+        params.video_url = item.url;
+      } else {
+        params.image_url = item.url;
+      }
+
+      const itemRes = await axios.post(`${GRAPH_BASE}/${igUserId}/media`, null, { params });
+      const itemId = itemRes.data.id;
+
+      // Videos inside carousels need to finish processing before parent container creation
+      if (isVideo) {
+        console.log(`ℹ️ [Meta:publishInstagramCarousel] Waiting for video item ${itemId} to process...`);
+        await waitForInstagramContainer(itemId, pageAccessToken);
+      }
+
+      childrenIds.push(itemId);
+    }
+
+    // STEP 2: Create Parent Carousel Container
+    console.log(`▶️ [Meta:publishInstagramCarousel] Creating parent container with children: [${childrenIds.join(', ')}]`);
+    const carouselRes = await axios.post(`${GRAPH_BASE}/${igUserId}/media`, null, {
+      params: {
+        media_type: 'CAROUSEL',
+        children: childrenIds.join(','),
+        caption: caption || '',
+        access_token: pageAccessToken
+      }
+    });
+
+    const carouselContainerId = carouselRes.data.id;
+
+    // STEP 3: Wait for parent container readiness
+    await waitForInstagramContainer(carouselContainerId, pageAccessToken);
+
+    // STEP 4: Publish Parent Carousel Container
+    console.log(`▶️ [Meta:publishInstagramCarousel] Publishing parent carousel ${carouselContainerId}...`);
+    const publishRes = await axios.post(`${GRAPH_BASE}/${igUserId}/media_publish`, null, {
+      params: {
+        creation_id: carouselContainerId,
+        access_token: pageAccessToken
+      }
+    });
+
+    const mediaId = publishRes.data.id;
+    console.log(`✅ [Meta:publishInstagramCarousel] Carousel published successfully, media_id=${mediaId}`);
+
+    let permalink = `https://www.instagram.com/p/${mediaId}`;
+    try {
+      const permalinkRes = await axios.get(`${GRAPH_BASE}/${mediaId}`, {
+        params: { fields: 'permalink', access_token: pageAccessToken }
+      });
+      if (permalinkRes.data?.permalink) {
+        permalink = permalinkRes.data.permalink;
+      }
+    } catch (e) {
+      // Non-critical error
+    }
+
+    return {
+      platformPostId: mediaId,
+      platformUrl: permalink
+    };
+
+  } catch (err) {
+    logMetaError('publishInstagramCarousel', err);
+    throw err;
+  }
+};
+
 module.exports = {
   getFacebookOAuthUrl,
   exchangeCodeForToken,
   getLongLivedUserToken,
   getUserPages,
+  getInstagramAccountId,
   revokeFacebookAccess,
-  publishFacebookReel
+  publishFacebookReel,
+  publishInstagramReel,
+  publishInstagramCarousel
 };

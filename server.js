@@ -13,7 +13,7 @@ const {
   startDriveAutoUploadScheduler
 } = require('./cron/scheduler');
 
-// Route Imports
+// Core Routes Import
 const authRoutes = require('./routes/auth');
 const dashboardRoutes = require('./routes/dashboard');
 const youtubeRoutes = require('./routes/youtube');
@@ -31,13 +31,13 @@ const seedAdminRoute = require('./routes/seedAdmin');
 
 const app = express();
 
-// Enable reverse proxy trust
+// Enable reverse proxy trust (Render / Heroku / AWS / Cloudflare)
 app.set('trust proxy', 1);
 
 // Security Headers
 app.use(helmet());
 
-// Dynamic CORS Setup
+// Dynamic CORS Configuration
 const allowedOrigins = (process.env.FRONTEND_URL || '')
   .split(',')
   .map((o) => o.trim())
@@ -54,14 +54,14 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 app.use(cookieParser());
 
 // Rate Limiters
 const globalLimiter = rateLimit({ 
   windowMs: 15 * 60 * 1000, 
-  max: 300,
+  max: 500,
   standardHeaders: true,
   legacyHeaders: false
 });
@@ -70,19 +70,18 @@ app.use('/api/', globalLimiter);
 const authLimiter = rateLimit({ 
   windowMs: 15 * 60 * 1000, 
   max: 20,
-  message: { success: false, message: 'Too many auth requests' }
+  message: { success: false, message: 'Too many login attempts. Please try again in 15 minutes.' }
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
 
-// --- API Route Mappings (With Plural/Singular Fallback Endpoints) ---
-
+// --- API Route Mappings ---
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/youtube', youtubeRoutes);
 app.use('/api/drive', driveRoutes);
 
-// Meta & Facebook Aliases (Fixes 404 Route Not Found on Meta)
+// Meta / Facebook Routes (Primary & Fallback Multi-Prefix Support)
 app.use('/api/meta', metaRoutes);
 app.use('/api/facebook', metaRoutes);
 app.use('/api/meta/facebook', metaRoutes);
@@ -96,7 +95,7 @@ app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
 
-// General & Admin Routes
+// Management & Analytics
 app.use('/api/wallet', walletRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/ai', aiRoutes);
@@ -109,19 +108,20 @@ if (require('fs').existsSync('./routes/posts.js')) {
   app.use('/api/posts', require('./routes/posts'));
 }
 
-// Health Check
+// Health Check Endpoint
 app.get('/api/health', (req, res) => res.json({ 
   success: true, 
-  message: 'TubePilot API is running',
+  status: 'healthy',
+  message: 'TubePilot Production API is running smoothly',
   timestamp: new Date().toISOString()
 }));
 
-// Fallback 404 for unmatched API requests
-app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
+// Global 404 Catch-All for API Routes
+app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'API route not found' }));
 
-// Global Error Handling
+// Global Centralized Error Handler
 app.use((err, req, res, next) => {
-  console.error('❌ [Server Error]:', err.stack || err.message);
+  console.error('❌ [Global Server Error]:', err.stack || err.message);
   
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ success: false, message: 'CORS policy blocked this request' });
@@ -135,22 +135,22 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 5000;
 
-const start = async () => {
+const startServer = async () => {
   try {
     await connectDB();
     app.listen(PORT, () => {
-      console.log(`🚀 TubePilot backend running on port ${PORT}`);
+      console.log(`🚀 TubePilot production backend live on port ${PORT}`);
       startPublishScheduler();
       startRetryScheduler();
       startFreeUploadReset();
       startDriveAutoUploadScheduler();
     });
   } catch (error) {
-    console.error('❌ Server startup error:', error.message);
+    console.error('❌ Fatal Server Startup Error:', error.message);
     process.exit(1);
   }
 };
 
-start();
+startServer();
 
 module.exports = app;

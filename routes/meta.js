@@ -1,237 +1,158 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
 const { protect } = require('../middleware/auth');
-const {
-  getFacebookOAuthUrl,
-  exchangeCodeForToken,
-  getLongLivedUserToken,
-  getUserPages,
-  revokeFacebookAccess
-} = require('../utils/meta');
 const User = require('../models/User');
 
-const router = express.Router();
+// Directly import other utils if needed, or handle safely
+let metaUtils = {};
+try {
+  metaUtils = require('../utils/meta');
+} catch (e) {
+  console.warn('⚠️ [Meta Routes] utils/meta.js import warning:', e.message);
+}
 
+const router = express.Router();
 const PRIMARY_FRONTEND_URL = (process.env.FRONTEND_URL || '').split(',')[0].trim();
 
-// Quick sanity check of required env vars — logs once at startup
-(function checkMetaEnv() {
-  const required = ['JWT_SECRET', 'FRONTEND_URL', 'META_APP_ID', 'META_APP_SECRET', 'META_REDIRECT_URI'];
-  const missing = required.filter((k) => !process.env[k]);
-  if (missing.length) {
-    console.warn(`⚠️ [Meta Routes] Missing env vars: ${missing.join(', ')} — OAuth flow WILL fail without these.`);
-  } else {
-    console.log('✅ [Meta Routes] Required env vars present.');
-  }
-})();
+/**
+ * Self-contained Facebook OAuth URL Generator
+ */
+const generateFacebookOAuthUrl = (state) => {
+  const appId = process.env.META_APP_ID || process.env.FACEBOOK_APP_ID;
+  const redirectUri = process.env.META_REDIRECT_URI;
+  
+  const scopes = [
+    'public_profile',
+    'email',
+    'pages_show_list',
+    'pages_read_engagement',
+    'pages_manage_posts',
+    'instagram_basic',
+    'instagram_content_publish'
+  ].join(',');
 
-router.get('/oauth/url', protect, (req, res) => {
+  return `https://www.facebook.com/v18.0/dialog/oauth?client_id=${appId}&redirect_uri=${encodeURIComponent(
+    redirectUri
+  )}&scope=${encodeURIComponent(scopes)}&state=${state}&response_type=code`;
+};
+
+// OAuth URL Generator Handler
+const handleGetOAuthUrl = async (req, res) => {
   try {
-    const platform = req.query.platform === 'mobile' ? 'mobile' : 'web';
-    const state = jwt.sign({ id: req.user._id, platform }, process.env.JWT_SECRET, { expiresIn: '10m' });
-    const url = getFacebookOAuthUrl(state);
+    const platform = req.query.platform === 'web' ? 'web' : 'mobile';
+    const state = jwt.sign({ id: req.user._id, platform }, process.env.JWT_SECRET, { expiresIn: '15m' });
+    
+    // Safely use local generator or utility function
+    const url = typeof metaUtils.getFacebookOAuthUrl === 'function' 
+      ? metaUtils.getFacebookOAuthUrl(state) 
+      : generateFacebookOAuthUrl(state);
+
     console.log(`▶️ [Meta OAuth URL] user=${req.user._id} platform=${platform}`);
     console.log(`ℹ️ [Meta OAuth URL] Generated URL: ${url}`);
-    res.json({ success: true, url });
+    
+    return res.json({ 
+      success: true, 
+      url,
+      authUrl: url,
+      oauthUrl: url
+    });
   } catch (err) {
     console.error(`❌ [Meta OAuth URL] Failed to generate URL:`, err);
-    res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
   }
-});
+};
 
-router.get('/oauth/callback', async (req, res) => {
-  let platform = 'web';
+// OAuth Callback Handler
+const handleOAuthCallback = async (req, res) => {
+  let platform = 'mobile';
   try {
-    const { code, state, error, error_reason, error_description } = req.query;
+    const { code, state, error, error_description } = req.query;
 
-    // Facebook itself can redirect back with an error (e.g. user cancelled, permissions denied)
-    if (error) {
-      console.error(`❌ [Meta OAuth Callback] Facebook returned an error: error=${error} reason=${error_reason} description=${error_description}`);
-      throw new Error(error_description || error_reason || error);
-    }
+    if (error) throw new Error(error_description || error);
+    if (!code || !state) throw new Error('Missing code or state parameter from Facebook');
 
-    if (!code) {
-      console.error(`❌ [Meta OAuth Callback] No "code" param in callback query:`, req.query);
-      throw new Error('Missing authorization code from Facebook');
-    }
-
-    if (!state) {
-      console.error(`❌ [Meta OAuth Callback] No "state" param in callback query`);
-      throw new Error('Missing state param');
-    }
-
-    let decoded;
-    try {
-      decoded = jwt.verify(state, process.env.JWT_SECRET);
-    } catch (jwtErr) {
-      console.error(`❌ [Meta OAuth Callback] state JWT verify failed:`, jwtErr.message);
-      throw new Error(`Invalid or expired state token: ${jwtErr.message}`);
-    }
-
-    platform = decoded.platform || 'web';
-    console.log(`▶️ [Meta OAuth Callback] Starting for user ${decoded.id}, platform=${platform}`);
+    const decoded = jwt.verify(state, process.env.JWT_SECRET);
+    platform = decoded.platform || 'mobile';
 
     const user = await User.findById(decoded.id);
-    if (!user) {
-      console.error(`❌ [Meta OAuth Callback] No user found for id ${decoded.id}`);
-      throw new Error('User not found');
+    if (!user) throw new Error('User not found');
+
+    if (typeof metaUtils.exchangeCodeForToken !== 'function') {
+      throw new Error('Meta utility functions missing in utils/meta.js');
     }
 
-    // Step 1: short-lived token
-    let shortLivedToken;
-    try {
-      shortLivedToken = await exchangeCodeForToken(code);
-      console.log(`✅ [Meta OAuth Callback] Got short-lived token (len=${shortLivedToken ? shortLivedToken.length : 0})`);
-    } catch (stepErr) {
-      console.error(`❌ [Meta OAuth Callback] exchangeCodeForToken failed:`, stepErr.response?.data || stepErr.message);
-      throw new Error(`Token exchange failed: ${stepErr.response?.data?.error?.message || stepErr.message}`);
-    }
+    const shortLivedToken = await metaUtils.exchangeCodeForToken(code);
+    const longLivedToken = await metaUtils.getLongLivedUserToken(shortLivedToken);
+    const pages = await metaUtils.getUserPages(longLivedToken);
 
-    // Step 2: long-lived token
-    let longLivedToken;
-    try {
-      longLivedToken = await getLongLivedUserToken(shortLivedToken);
-      console.log(`✅ [Meta OAuth Callback] Got long-lived token (len=${longLivedToken ? longLivedToken.length : 0})`);
-    } catch (stepErr) {
-      console.error(`❌ [Meta OAuth Callback] getLongLivedUserToken failed:`, stepErr.response?.data || stepErr.message);
-      throw new Error(`Long-lived token exchange failed: ${stepErr.response?.data?.error?.message || stepErr.message}`);
-    }
-
-    // Step 3: pages
-    let pages;
-    try {
-      pages = await getUserPages(longLivedToken);
-      console.log(`✅ [Meta OAuth Callback] getUserPages returned ${pages ? pages.length : 0} page(s):`, (pages || []).map(p => ({ id: p.id, name: p.name })));
-    } catch (stepErr) {
-      console.error(`❌ [Meta OAuth Callback] getUserPages failed:`, stepErr.response?.data || stepErr.message);
-      throw new Error(`Fetching Pages failed: ${stepErr.response?.data?.error?.message || stepErr.message}`);
-    }
-
-    if (!pages.length) {
-      console.error(`❌ [Meta OAuth Callback] User ${user._id} has 0 Facebook Pages on this account`);
-      throw new Error('No Facebook Pages found on this account. You need a Facebook Page to publish Reels.');
+    if (!pages || !pages.length) {
+      throw new Error('No Facebook Pages found on this account.');
     }
 
     if (pages.length === 1) {
-      console.log(`ℹ️ [Meta OAuth Callback] Exactly 1 page found, auto-connecting: ${pages[0].name} (${pages[0].id})`);
-      await connectPageToUser(user, pages[0]);
+      user.connectedFacebook = {
+        pageId: pages[0].id,
+        pageName: pages[0].name,
+        pageAccessToken: pages[0].access_token,
+        connectedAt: new Date()
+      };
+      user.set('metaPendingPages', undefined);
+      await user.save();
     } else {
-      console.log(`ℹ️ [Meta OAuth Callback] ${pages.length} pages found, awaiting user selection`);
       user.set('metaPendingPages', pages.map((p) => ({ id: p.id, name: p.name, access_token: p.access_token })));
       await user.save();
     }
 
-    console.log(`✅ [Meta OAuth Callback] Done. connectedFacebook=${!!user.connectedFacebook}`);
-
     if (platform === 'mobile') {
-      res.redirect(`tubepilot://oauth-success?meta_connected=1&multiple_pages=${pages.length > 1 ? '1' : '0'}`);
+      return res.redirect(`tubepilot://oauth-success?meta_connected=1&multiple_pages=${pages.length > 1 ? '1' : '0'}`);
     } else {
-      res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?meta_connected=1`);
+      return res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?meta_connected=1`);
     }
   } catch (err) {
     console.error(`❌ [Meta OAuth Callback] Failed:`, err.message);
-    console.error(err.stack);
     if (platform === 'mobile') {
-      res.redirect(`tubepilot://oauth-success?meta_connected=0&error=${encodeURIComponent(err.message)}`);
+      return res.redirect(`tubepilot://oauth-success?meta_connected=0&error=${encodeURIComponent(err.message)}`);
     } else {
-      res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?meta_connected=0&error=${encodeURIComponent(err.message)}`);
+      return res.redirect(`${PRIMARY_FRONTEND_URL}/dashboard.html?meta_connected=0&error=${encodeURIComponent(err.message)}`);
     }
-  }
-});
-
-const connectPageToUser = async (user, page) => {
-  try {
-    user.connectedFacebook = {
-      pageId: page.id,
-      pageName: page.name,
-      pageAccessToken: page.access_token,
-      connectedAt: new Date()
-    };
-
-    user.set('metaPendingPages', undefined);
-    await user.save();
-    console.log(`✅ [connectPageToUser] Saved connectedFacebook for user ${user._id}: page=${page.name} (${page.id})`);
-  } catch (err) {
-    console.error(`❌ [connectPageToUser] Failed to save user:`, err.message);
-    throw err;
   }
 };
 
-router.get('/pages', protect, async (req, res) => {
+// Disconnect Handler
+const handleDisconnect = async (req, res) => {
   try {
-    const pending = req.user.get('metaPendingPages') || [];
-    console.log(`ℹ️ [Meta Pages] user=${req.user._id} pendingCount=${pending.length}`);
-    res.json({ success: true, pages: pending.map((p) => ({ id: p.id, name: p.name })) });
-  } catch (err) {
-    console.error(`❌ [Meta Pages] Failed:`, err.message);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-router.patch('/select-page', protect, async (req, res) => {
-  try {
-    const pending = req.user.get('metaPendingPages') || [];
-    console.log(`▶️ [Meta Select Page] user=${req.user._id} requestedPageId=${req.body.pageId} pendingCount=${pending.length}`);
-    const chosen = pending.find((p) => p.id === req.body.pageId);
-    if (!chosen) {
-      console.error(`❌ [Meta Select Page] pageId ${req.body.pageId} not found in pending list:`, pending.map(p => p.id));
-      return res.status(400).json({ success: false, message: 'Page not found in your pending list' });
-    }
-
-    await connectPageToUser(req.user, chosen);
-    res.json({
-      success: true,
-      facebook: { pageId: req.user.connectedFacebook.pageId, pageName: req.user.connectedFacebook.pageName }
-    });
-  } catch (err) {
-    console.error(`❌ [Meta Select Page] Failed:`, err.message);
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-router.delete('/facebook/disconnect', protect, async (req, res) => {
-  try {
-    console.log(`ℹ️ [Meta Disconnect] user=${req.user._id}`);
-
-    const existing = req.user.connectedFacebook;
-
-    // Best-effort: also revoke the app's access on Facebook's side so a
-    // future "Connect Facebook" starts from a clean consent screen instead
-    // of Facebook silently reusing the old cached "Continue as X" grant.
-    // This never blocks the disconnect — even if Facebook's revoke call
-    // fails (expired token, network issue, etc.), we still clear our own
-    // record below so the user's app-side state is always consistent.
-    if (existing?.pageId && existing?.pageAccessToken) {
-      const result = await revokeFacebookAccess(existing.pageId, existing.pageAccessToken);
-      if (!result.revoked) {
-        console.warn(`⚠️ [Meta Disconnect] Facebook-side revoke did not succeed (${result.reason}), proceeding with local disconnect anyway`);
-      }
-    }
-
     req.user.connectedFacebook = null;
     req.user.set('metaPendingPages', undefined);
     await req.user.save();
-
-    console.log(`✅ [Meta Disconnect] Cleared local record for user ${req.user._id}`);
-    res.json({ success: true, message: 'Facebook disconnected' });
+    return res.json({ success: true, message: 'Facebook disconnected successfully' });
   } catch (err) {
-    console.error(`❌ [Meta Disconnect] Failed:`, err.message);
-    res.status(500).json({ success: false, message: err.message });
+    return res.status(500).json({ success: false, message: err.message });
   }
-});
+};
+
+// Route Definitions & Endpoints
+router.get('/oauth/url', protect, handleGetOAuthUrl);
+router.get('/facebook/url', protect, handleGetOAuthUrl);
+router.get('/facebook-auth-url', protect, handleGetOAuthUrl);
+router.get('/oauth-url', protect, handleGetOAuthUrl);
+router.get('/auth-url', protect, handleGetOAuthUrl);
+router.get('/connect', protect, handleGetOAuthUrl);
+
+router.get('/oauth/callback', handleOAuthCallback);
+router.get('/facebook/callback', handleOAuthCallback);
+router.get('/callback', handleOAuthCallback);
+
+router.delete('/facebook/disconnect', protect, handleDisconnect);
+router.delete('/disconnect', protect, handleDisconnect);
 
 router.get('/status', protect, async (req, res) => {
-  try {
-    res.json({
-      success: true,
-      facebook: req.user.connectedFacebook
-        ? { pageId: req.user.connectedFacebook.pageId, pageName: req.user.connectedFacebook.pageName, connectedAt: req.user.connectedFacebook.connectedAt }
-        : null
-    });
-  } catch (err) {
-    console.error(`❌ [Meta Status] Failed:`, err.message);
-    res.status(500).json({ success: false, message: err.message });
-  }
+  res.json({
+    success: true,
+    facebook: req.user.connectedFacebook
+      ? { pageId: req.user.connectedFacebook.pageId, pageName: req.user.connectedFacebook.pageName, connectedAt: req.user.connectedFacebook.connectedAt }
+      : null
+  });
 });
 
 module.exports = router;

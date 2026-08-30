@@ -32,7 +32,7 @@ const postsRoutes = require('./routes/posts');
 
 const app = express();
 
-// Required because Render (and most hosts) sit behind a reverse proxy
+// Required because Render / cloud proxies pass client IP headers
 app.set('trust proxy', 1);
 
 // --- Security & Core Middleware ---
@@ -43,10 +43,9 @@ const allowedOrigins = (process.env.FRONTEND_URL || '')
   .map((o) => o.trim())
   .filter(Boolean);
 
-// Enhanced CORS setup: Supports Web, Mobile Apps, and API clients
+// Flexible CORS Handling
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow non-browser calls (like Mobile Apps or Postman) or matched frontend origins
     if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') {
       return callback(null, true);
     }
@@ -77,18 +76,21 @@ const authLimiter = rateLimit({
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
 
-// --- API Route Registrations & Fallback Aliases ---
+// --- Route Registrations with Aliases ---
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/youtube', youtubeRoutes);
 app.use('/api/drive', driveRoutes);
-app.use('/api/meta', metaRoutes);
 
-// Video Routes (Supports both Singular and Plural aliases)
+// Meta / Facebook Routes (Supports /api/meta & /api/facebook)
+app.use('/api/meta', metaRoutes);
+app.use('/api/facebook', metaRoutes);
+
+// Video Routes
 app.use('/api/videos', videoRoutes);
 app.use('/api/video', videoRoutes);
 
-// Diamond & Payment Routes (Supports plural, singular, and payment aliases)
+// Diamond & Payment Routes
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
@@ -102,21 +104,20 @@ app.use('/api/ratings', ratingsRoutes);
 app.use('/api/seed-admin', seedAdminRoute);
 app.use('/api/posts', postsRoutes);
 
-// Health Check Endpoint
+// Health Endpoint
 app.get('/api/health', (req, res) => res.json({ 
   success: true, 
   message: 'TubePilot API is running',
   timestamp: new Date().toISOString()
 }));
 
-// Catch-all 404 for API endpoints
+// Fallback 404 for unmatched API routes
 app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
 
-// Centralized Global Error Handling Middleware
+// Global Error Handler
 app.use((err, req, res, next) => {
   console.error('❌ [Global Server Error]:', err.stack || err.message);
   
-  // Handle CORS Error explicitly
   if (err.message === 'Not allowed by CORS') {
     return res.status(403).json({ success: false, message: 'CORS policy blocked this request' });
   }

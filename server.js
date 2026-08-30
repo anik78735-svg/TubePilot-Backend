@@ -32,18 +32,18 @@ const postsRoutes = require('./routes/posts');
 
 const app = express();
 
-// Required because Render / cloud proxies pass client IP headers
+// Enable reverse proxy trust for hosts like Render, Heroku, Railway
 app.set('trust proxy', 1);
 
-// --- Security & Core Middleware ---
+// Security Headers
 app.use(helmet());
 
+// Dynamic CORS Configuration
 const allowedOrigins = (process.env.FRONTEND_URL || '')
   .split(',')
   .map((o) => o.trim())
   .filter(Boolean);
 
-// Flexible CORS Handling
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin) || process.env.NODE_ENV !== 'production') {
@@ -55,6 +55,7 @@ app.use(cors({
   credentials: true
 }));
 
+// Body Parsing & Cookie Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
@@ -76,25 +77,30 @@ const authLimiter = rateLimit({
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/signup', authLimiter);
 
-// --- Route Registrations with Aliases ---
+// --- API Route Mappings with Fallback Aliases ---
+
+// Core & Authentication
 app.use('/api/auth', authRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/youtube', youtubeRoutes);
 app.use('/api/drive', driveRoutes);
+app.use('/api/posts', postsRoutes);
 
-// Meta / Facebook Routes (Supports /api/meta & /api/facebook)
+// Meta / Facebook Routes (Supports /meta, /facebook, and /meta/facebook)
 app.use('/api/meta', metaRoutes);
 app.use('/api/facebook', metaRoutes);
+app.use('/api/meta/facebook', metaRoutes);
 
-// Video Routes
+// Video Routes (Supports both plural and singular)
 app.use('/api/videos', videoRoutes);
 app.use('/api/video', videoRoutes);
 
-// Diamond & Payment Routes
+// Diamond & Payment Routes (Supports plural, singular, and payment)
 app.use('/api/diamonds', diamondRoutes);
 app.use('/api/diamond', diamondRoutes);
 app.use('/api/payment', diamondRoutes);
 
+// Analytics, Admin, Wallet & Utilities
 app.use('/api/wallet', walletRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/ai', aiRoutes);
@@ -102,19 +108,18 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/ratings', ratingsRoutes);
 app.use('/api/seed-admin', seedAdminRoute);
-app.use('/api/posts', postsRoutes);
 
-// Health Endpoint
+// Health Check Endpoint
 app.get('/api/health', (req, res) => res.json({ 
   success: true, 
   message: 'TubePilot API is running',
   timestamp: new Date().toISOString()
 }));
 
-// Fallback 404 for unmatched API routes
+// Catch-all 404 for API endpoints
 app.use('/api', (req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
 
-// Global Error Handler
+// Centralized Global Error Handler
 app.use((err, req, res, next) => {
   console.error('❌ [Global Server Error]:', err.stack || err.message);
   

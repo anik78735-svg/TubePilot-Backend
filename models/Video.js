@@ -1,6 +1,5 @@
 const mongoose = require('mongoose');
 
-// Per-platform publish record
 const PlatformTargetSchema = new mongoose.Schema({
   platform: { type: String, enum: ['youtube', 'facebook', 'instagram'], required: true },
   postType: { type: String, enum: ['video', 'reel', 'carousel', 'post'], default: 'video' },
@@ -11,7 +10,7 @@ const PlatformTargetSchema = new mongoose.Schema({
   },
   scheduledAt: { type: Date, default: null },
 
-  // Metadata fields
+  // Metadata
   title: { type: String, default: '' },
   description: { type: String, default: '' },
   caption: { type: String, default: '' },
@@ -35,14 +34,14 @@ const PlatformTargetSchema = new mongoose.Schema({
 const VideoSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
 
-  // Storage and Source
+  // Primary Storage
   storageProvider: { type: String, enum: ['cloudinary_1', 'cloudinary_2', 'google_drive', 'youtube', 'direct_url'], default: null },
   storageFileId: { type: String, default: '' },
   storageUrl: { type: String, default: '' },
   
-  // Single Video OR Carousel Media Items Support
+  // Single File or Carousel Media URLs Array
   videoUrl: { type: String, default: '' },
-  mediaUrls: [{ type: String }], // Multi-item support for Instagram Carousel
+  mediaUrls: [{ type: String }], // Carousel support for Instagram/Facebook
   
   fileSizeBytes: { type: Number, default: 0 },
   storageDeleteAt: { type: Date, default: null },
@@ -50,23 +49,21 @@ const VideoSchema = new mongoose.Schema({
   sourceProvider: { type: String, enum: ['manual', 'drive_auto'], default: 'manual' },
   sourceDriveFileId: { type: String, default: '' },
 
-  // Platform details & root-level quick access fields
+  // Root platform status indicator
   platform: { type: String, enum: ['youtube', 'facebook', 'instagram', 'multi'], default: 'youtube' },
   postType: { type: String, enum: ['video', 'reel', 'carousel', 'post'], default: 'video' },
   platformPostId: { type: String, default: '' },
   platformUrl: { type: String, default: '' },
 
-  // Platforms Target Array
+  // Target Platforms List
   platforms: { type: [PlatformTargetSchema], default: [] },
 
-  // Status
   status: {
     type: String,
     enum: ['draft', 'queued', 'processing', 'uploaded', 'partially_uploaded', 'failed'],
     default: 'draft'
   },
 
-  // Credits tracking
   diamondsCharged: { type: Number, default: 0 },
   usedFreeUpload: { type: Boolean, default: false },
 

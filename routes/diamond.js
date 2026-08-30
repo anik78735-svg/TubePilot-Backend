@@ -9,21 +9,23 @@ const router = express.Router();
 // Helper to sanitize phone for Cashfree requirements
 const formatPhoneNumber = (phoneStr) => {
   if (!phoneStr) return '9999999999';
-  const cleaned = phoneStr.replace(/\D/g, '');
+  const cleaned = String(phoneStr).replace(/\D/g, '');
   if (cleaned.length >= 10) {
     return cleaned.slice(-10);
   }
   return '9999999999';
 };
 
-// @route   POST /api/diamonds/create-order
-// @desc    Creates Cashfree Payment Order for Diamond Purchase
-router.post('/create-order', protect, async (req, res) => {
+/**
+ * Controller: Create Cashfree Payment Order
+ */
+const handleCreateOrder = async (req, res) => {
   try {
-    const { diamondPackage } = req.body; // Package options: 10, 50, 100, 200
+    // Accepts 'diamondPackage', 'packageId', or 'amount' to ensure full frontend compatibility
+    const requestedPackage = req.body.diamondPackage || req.body.packageId || req.body.amount;
 
     const validPackages = [10, 50, 100, 200];
-    const pkgAmount = Number(diamondPackage);
+    const pkgAmount = Number(requestedPackage);
 
     if (!validPackages.includes(pkgAmount)) {
       return res.status(400).json({
@@ -84,7 +86,7 @@ router.post('/create-order', protect, async (req, res) => {
       status: 'pending'
     });
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       paymentSessionId: payment_session_id,
       orderId: orderId,
@@ -94,16 +96,17 @@ router.post('/create-order', protect, async (req, res) => {
 
   } catch (err) {
     console.error('❌ [Cashfree Order Error]:', err.response?.data || err.message);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: err.response?.data?.message || 'Failed to initialize Cashfree payment order.'
     });
   }
-});
+};
 
-// @route   POST /api/diamonds/verify-payment
-// @desc    Verifies payment with Cashfree after SDK callback & credits diamonds
-router.post('/verify-payment', protect, async (req, res) => {
+/**
+ * Controller: Verify Cashfree Payment & Credit Diamonds
+ */
+const handleVerifyPayment = async (req, res) => {
   try {
     const { orderId } = req.body;
 
@@ -146,15 +149,17 @@ router.post('/verify-payment', protect, async (req, res) => {
       transaction.reviewedAt = new Date();
       await transaction.save();
 
-      // Add purchased diamonds to user account
-      const user = await User.findById(req.user._id);
-      user.diamondBalance += transaction.diamondPackage;
-      await user.save();
+      // Atomically add purchased diamonds to user account
+      const updatedUser = await User.findByIdAndUpdate(
+        req.user._id,
+        { $inc: { diamondBalance: transaction.diamondPackage } },
+        { new: true }
+      );
 
       return res.json({
         success: true,
         message: 'Payment verified successfully! Diamonds added.',
-        diamondBalance: user.diamondBalance
+        diamondBalance: updatedUser.diamondBalance
       });
     } else {
       transaction.status = 'rejected';
@@ -168,11 +173,24 @@ router.post('/verify-payment', protect, async (req, res) => {
 
   } catch (err) {
     console.error('❌ [Verify Payment Error]:', err.response?.data || err.message);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: err.response?.data?.message || 'Payment verification failed.'
     });
   }
-});
+};
+
+// -----------------------------------------------------------------------
+// Route Registrations (Supports both standard endpoints and legacy aliases)
+// -----------------------------------------------------------------------
+
+// Order Creation Endpoints
+router.post('/create-order', protect, handleCreateOrder);
+router.post('/buy-diamonds', protect, handleCreateOrder);
+router.post('/buy', protect, handleCreateOrder);
+
+// Payment Verification Endpoints
+router.post('/verify-payment', protect, handleVerifyPayment);
+router.post('/verify', protect, handleVerifyPayment);
 
 module.exports = router;
